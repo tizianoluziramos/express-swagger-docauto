@@ -227,11 +227,40 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
   }
   return Object.keys(columns).length ? { type: "object", properties: columns } : { type: "object" };
 }
+// Cache wrappers are transparent to Sequelize consumers. Only unwrap an
+// `init(model)` call when its receiver originates from a known cache package;
+// a different library's `init` may not preserve the model's shape.
+const sequelizeCachePackages = new Set(["sequelize-simple-cache-redis", "sequelize-simple-cache"]);
+function isSequelizeCache(project, file, receiver) {
+  const cache = project.resolveExpression(file, receiver);
+  const instance = unwrap(cache?.node);
+  if (!instance || !ts.isNewExpression(instance)) return false;
+  const constructor = unwrap(instance.expression);
+  if (!ts.isIdentifier(constructor)) return false;
+  const imported = project.file(cache.file)?.imports.get(constructor.text);
+  return imported && sequelizeCachePackages.has(imported.spec);
+}
+function sequelizeDefinition(project, file, expression, visited = new Set()) {
+  if (!expression || visited.size > 20) return null;
+  const target = project.resolveExpression(file, expression);
+  if (!target) return null;
+  const node = unwrap(target.node);
+  const key = `${target.file}:${node.pos}:${node.end}`;
+  if (visited.has(key)) return null;
+  visited.add(key);
+  if (!ts.isCallExpression(node)) return null;
+  if (member(node.expression) === "define") return { file: target.file, node };
+  if (member(node.expression) === "init" && node.arguments.length &&
+      isSequelizeCache(project, target.file, node.expression.expression)) {
+    return sequelizeDefinition(project, target.file, node.arguments[0], visited);
+  }
+  return null;
+}
 function sequelizeModelShape(project, file, call) {
-  const target = project.resolveExpression(file, call.expression.expression);
-  const definition = unwrap(target?.node);
-  if (!definition || !ts.isCallExpression(definition) || member(definition.expression) !== "define") return {};
-  return sequelizeDefinitionShape(project, target.file, definition, file, call.arguments[0]);
+  const source = call.expression.expression;
+  const model = sequelizeDefinition(project, file, source);
+  if (!model) return {};
+  return sequelizeDefinitionShape(project, model.file, model.node, file, call.arguments[0]);
 }
 // Object.fromEntries may expose model fields via computed keys. Only infer
 // their types when one local Sequelize definition matches all of the keys.

@@ -175,19 +175,21 @@ function knownFieldSchema(kind, values) {
   field.example = items[0];
   return field;
 }
-// Infer only columns declared on a local Sequelize model. The fields are
-// partial for safety: includes, computed getters and scopes can add values.
+// Infer the columns selected by a Sequelize query, including association-created
+// foreign keys. Eager-loaded associations are expanded separately and only when
+// an explicit include is present in the query.
 function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = modelFile, query = null) {
   const declarations = unwrap(definition.arguments[1]);
   if (!declarations || !ts.isObjectLiteralExpression(declarations)) return {};
   const modelOptions = project.staticValue(modelFile, definition.arguments[2]) ?? {};
   const exclusions = new Set(modelOptions.defaultScope?.attributes?.exclude ?? []);
   let selection = null;
-  query = unwrap(query);
+  const resolvedQuery = resolveOptionExpression(project, sourceFile, query);
+  query = resolvedQuery?.node ?? unwrap(query);
   if (query && ts.isObjectLiteralExpression(query)) {
     const attr = query.properties.find((part) => ts.isPropertyAssignment(part) && propertyName(part.name) === "attributes");
     if (attr) {
-      const selected = project.staticValue(sourceFile, attr.initializer);
+      const selected = project.staticValue(resolvedQuery?.file ?? sourceFile, attr.initializer);
       if (Array.isArray(selected)) selection = new Set(selected);
       else if (selected && typeof selected === "object") {
         for (const field of selected.exclude ?? []) exclusions.add(field);
@@ -203,19 +205,31 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
     if (!ts.isObjectLiteralExpression(settings)) continue;
     const field = settings.properties.find((part) => ts.isPropertyAssignment(part) && propertyName(part.name) === "type");
     if (!field) continue;
-    let value = unwrap(field.initializer);
+    const originalType = unwrap(field.initializer);
+    let value = originalType;
     if (ts.isCallExpression(value)) value = unwrap(value.expression);
     let datatype = member(value);
     if (datatype === "UNSIGNED" || datatype === "ZEROFILL") datatype = member(value.expression);
     const col = {
       UUID: { type: "string", format: "uuid" }, UUIDV4: { type: "string", format: "uuid" },
       STRING: { type: "string" }, TEXT: { type: "string" }, CHAR: { type: "string" },
+      ENUM: { type: "string" },
       BOOLEAN: { type: "boolean" }, DATE: { type: "string", format: "date-time" }, DATEONLY: { type: "string", format: "date" },
       INTEGER: { type: "integer" }, BIGINT: { type: "integer" }, SMALLINT: { type: "integer" }, TINYINT: { type: "integer" },
       FLOAT: { type: "number" }, DOUBLE: { type: "number" }, REAL: { type: "number" }, DECIMAL: { type: "number" },
       JSON: {}, JSONB: {}, BLOB: { type: "string", format: "byte" },
     }[datatype];
     if (!col) continue;
+    if (ts.isCallExpression(originalType)) {
+      if (["STRING", "CHAR"].includes(datatype)) {
+        const length = project.staticValue(modelFile, originalType.arguments[0]);
+        if (Number.isSafeInteger(length) && length > 0) col.maxLength = length;
+      } else if (datatype === "ENUM") {
+        const args = originalType.arguments.map((part) => project.staticValue(modelFile, part));
+        const values = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
+        if (values.length && values.every((item) => typeof item === "string")) col.enum = values;
+      }
+    }
     const nullable = settings.properties.find((part) => ts.isPropertyAssignment(part) && propertyName(part.name) === "allowNull");
     const primary = settings.properties.find((part) => ts.isPropertyAssignment(part) && propertyName(part.name) === "primaryKey");
     const notNull = (nullable && project.staticValue(modelFile, nullable.initializer) === false) ||
@@ -224,6 +238,11 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
   }
   if (modelOptions.timestamps !== false) for (const field of ["createdAt", "updatedAt"]) {
     if (!exclusions.has(field) && (!selection || selection.has(field))) columns[field] ??= { type: "string", format: "date-time" };
+  }
+  const identity = modelIdentity({ file: modelFile, node: definition });
+  for (const fk of foreignKeysFor(project, identity)) {
+    if (columns[fk.name] || exclusions.has(fk.name) || (selection && !selection.has(fk.name))) continue;
+    columns[fk.name] = fk.required ? fk.schema : { anyOf: [fk.schema, { type: "null" }] };
   }
   return Object.keys(columns).length ? { type: "object", properties: columns } : { type: "object" };
 }
@@ -256,11 +275,234 @@ function sequelizeDefinition(project, file, expression, visited = new Set()) {
   }
   return null;
 }
+// Canonical model identity survives imports, re-exports, aliases and recognized
+// cache.init(Model) wrappers. No module or Redis connection is executed.
+const modelIdentity = (model) => model && `${model.file}:${model.node.pos}:${model.node.end}`;
+const associationMethods = new Set(["belongsTo", "hasOne", "hasMany", "belongsToMany"]);
+const pluralRelations = new Set(["hasMany", "belongsToMany"]);
+
+function associationsFor(project) {
+  if (project._swaggerdocAssociations) return project._swaggerdocAssociations;
+  const graph = new Map();
+  const models = new Map();
+  // Store the graph early to avoid re-entrant catalog building.
+  project._swaggerdocAssociations = { graph, models };
+  for (const [file, source] of project.cache) {
+    walk(source.ast, (node) => {
+      if (!ts.isCallExpression(node) || !associationMethods.has(member(node.expression)) ||
+          !ts.isPropertyAccessExpression(node.expression) || !node.arguments.length) return;
+      const owner = sequelizeDefinition(project, file, node.expression.expression);
+      const target = sequelizeDefinition(project, file, node.arguments[0]);
+      if (!owner || !target) return;
+      const ownerKey = modelIdentity(owner);
+      const targetKey = modelIdentity(target);
+      models.set(ownerKey, owner);
+      models.set(targetKey, target);
+      const kind = member(node.expression);
+      const opts = project.staticValue(file, node.arguments[1]) ?? {};
+      const name = project.staticValue(target.file, target.node.arguments[0]);
+      const alias = typeof opts.as === "string" ? opts.as :
+        typeof name === "string" ? kind === "hasMany" || kind === "belongsToMany" ? `${name}s` : name : null;
+      const configuredKey = typeof opts.foreignKey === "string" ? opts.foreignKey : opts.foreignKey?.name;
+      const fk = typeof configuredKey === "string" ? configuredKey : null;
+      const association = { ownerKey, targetKey, kind, alias, foreignKey: fk, foreignKeyOptions: opts.foreignKey };
+      if (!graph.has(ownerKey)) graph.set(ownerKey, []);
+      if (!graph.get(ownerKey).some((prev) => prev.kind === kind && prev.targetKey === targetKey && prev.alias === alias)) {
+        graph.get(ownerKey).push(association);
+      }
+    });
+  }
+  return project._swaggerdocAssociations;
+}
+function primaryKeyShape(project, model) {
+  const props = unwrap(model.node.arguments[1]);
+  if (!props || !ts.isObjectLiteralExpression(props)) return { type: "string", format: "uuid" };
+  const fields = sequelizeDefinitionShapeBare(project, model.file, model.node);
+  for (const field of props.properties) {
+    if (!ts.isPropertyAssignment(field)) continue;
+    const settings = unwrap(field.initializer);
+    if (!settings || !ts.isObjectLiteralExpression(settings)) continue;
+    const primary = settings.properties.find((p) => ts.isPropertyAssignment(p) && propertyName(p.name) === "primaryKey");
+    if (primary && project.staticValue(model.file, primary.initializer) === true) {
+      const schema = fields[propertyName(field.name)];
+      if (schema) return schema.anyOf?.find((v) => v.type !== "null") ?? schema;
+    }
+  }
+  return { type: "integer" }; // Sequelize's implicit `id` primary key.
+}
+function sequelizeDefinitionShapeBare(project, file, definition) {
+  // Avoid recursing through the associations catalog when reading a PK type.
+  const declarations = unwrap(definition.arguments[1]);
+  if (!declarations || !ts.isObjectLiteralExpression(declarations)) return {};
+  const fields = {};
+  for (const field of declarations.properties) {
+    if (!ts.isPropertyAssignment(field)) continue;
+    const name = propertyName(field.name);
+    const options = unwrap(field.initializer);
+    if (!name || !ts.isObjectLiteralExpression(options)) continue;
+    const type = options.properties.find((p) => ts.isPropertyAssignment(p) && propertyName(p.name) === "type");
+    if (!type) continue;
+    let node = unwrap(type.initializer);
+    if (ts.isCallExpression(node)) node = unwrap(node.expression);
+    const datatype = member(node);
+    fields[name] = ({ UUID: { type: "string", format: "uuid" }, UUIDV4: { type: "string", format: "uuid" },
+      INTEGER: { type: "integer" }, BIGINT: { type: "integer" }, STRING: { type: "string" } })[datatype] ?? { type: "string" };
+  }
+  return fields;
+}
+function foreignKeysFor(project, key) {
+  const { graph, models } = associationsFor(project);
+  const columns = [];
+  for (const [owner, relations] of graph) for (const relation of relations) {
+    let appliesTo = null;
+    let reference = null;
+    if (relation.kind === "belongsTo" && owner === key) {
+      appliesTo = relation.foreignKey;
+      reference = models.get(relation.targetKey);
+    } else if (["hasOne", "hasMany"].includes(relation.kind) && relation.targetKey === key) {
+      appliesTo = relation.foreignKey;
+      reference = models.get(owner);
+    }
+    if (!appliesTo || !reference) continue;
+    const options = relation.foreignKeyOptions;
+    columns.push({ name: appliesTo, schema: primaryKeyShape(project, reference),
+      required: typeof options === "object" && options !== null && options.allowNull === false });
+  }
+  return columns;
+}
+function objectProperty(node, name) {
+  return node?.properties?.find((prop) => ts.isPropertyAssignment(prop) && propertyName(prop.name) === name)?.initializer;
+}
+// Follow constant, imported and helper-returned query/include expressions,
+// but never execute project code. An expression can come from another file.
+function resolveOptionExpression(project, file, expression, seen = new Set(), depth = 0) {
+  if (!expression || depth > 24) return null;
+  const node = unwrapAwait(expression);
+  if (!node) return null;
+  const key = `${file}:${node.pos}:${node.end}`;
+  if (seen.has(key)) return null;
+  const next = new Set(seen); next.add(key);
+  if (ts.isCallExpression(node)) {
+    const resolved = project.resolveExpression(file, node.expression);
+    const fn = resolved?.node;
+    if (fn && functionLike(fn)) {
+      if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) {
+        return resolveOptionExpression(project, resolved.file, fn.body, next, depth + 1);
+      }
+      const returns = [];
+      for (const statement of fn.body?.statements ?? []) {
+        if (ts.isReturnStatement(statement) && statement.expression) returns.push(statement.expression);
+        // A callback nested within the function does not become its return.
+        if (ts.isIfStatement(statement)) for (const branch of [statement.thenStatement, statement.elseStatement]) {
+          if (branch && ts.isReturnStatement(branch) && branch.expression) returns.push(branch.expression);
+        }
+      }
+      if (returns.length === 1) {
+        const result = unwrap(returns[0]);
+        if (ts.isIdentifier(result)) {
+          for (const statement of fn.body?.statements ?? []) {
+            if (!ts.isVariableStatement(statement)) continue;
+            for (const declaration of statement.declarationList.declarations) {
+              if (ts.isIdentifier(declaration.name) && declaration.name.text === result.text && declaration.initializer) {
+                return resolveOptionExpression(project, resolved.file, declaration.initializer, next, depth + 1);
+              }
+            }
+          }
+        }
+        return resolveOptionExpression(project, resolved.file, result, next, depth + 1);
+      }
+    }
+  }
+  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const resolved = project.resolveExpression(file, node);
+    if (resolved && (resolved.file !== file || resolved.node !== node)) {
+      return resolveOptionExpression(project, resolved.file, resolved.node, next, depth + 1);
+    }
+  }
+  return { file, node };
+}
+function collectIncludeNodes(project, file, expression, seen = new Set(), depth = 0) {
+  if (!expression || depth > 18) return [];
+  // Sequelize also accepts `include: [Role]` without a model/as wrapper.
+  // Preserve the original import expression rather than reducing it to
+  // its sequelize.define(...) declaration in this particular syntax.
+  if (sequelizeDefinition(project, file, expression)) {
+    return [{ file, node: unwrap(expression) }];
+  }
+  const resolved = resolveOptionExpression(project, file, expression);
+  if (!resolved) return [];
+  const node = unwrap(resolved.node);
+  const key = `${resolved.file}:${node.pos}:${node.end}`;
+  if (seen.has(key)) return [];
+  const next = new Set(seen); next.add(key);
+  if (ts.isArrayLiteralExpression(node)) return node.elements.flatMap((part) =>
+    collectIncludeNodes(project, resolved.file, ts.isSpreadElement(part) ? part.expression : part, next, depth + 1));
+  if (ts.isConditionalExpression(node)) return [
+    ...collectIncludeNodes(project, resolved.file, node.whenTrue, next, depth + 1),
+    ...collectIncludeNodes(project, resolved.file, node.whenFalse, next, depth + 1),
+  ];
+  if (ts.isObjectLiteralExpression(node) || ts.isStringLiteralLike(node) ||
+      ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) return [{ file: resolved.file, node }];
+  return [];
+}
+function includedAssociation(project, parentKey, file, includeNode) {
+  const { graph, models } = associationsFor(project);
+  const available = graph.get(parentKey) ?? [];
+  if (!available.length) return null;
+  const object = ts.isObjectLiteralExpression(includeNode) ? includeNode : null;
+  const as = object ? project.staticValue(file, objectProperty(object, "as")) : null;
+  const associationArg = object ? objectProperty(object, "association") : includeNode;
+  const aliasValue = associationArg && ts.isPropertyAccessExpression(associationArg) ? member(associationArg) :
+    project.staticValue(file, associationArg);
+  const alias = typeof as === "string" ? as : typeof aliasValue === "string" ? aliasValue : null;
+  const modelArg = object ? objectProperty(object, "model") : includeNode;
+  const model = sequelizeDefinition(project, file, modelArg);
+  const targetKey = modelIdentity(model);
+  const matches = available.filter((relation) => (!alias || relation.alias === alias) &&
+    (!targetKey || relation.targetKey === targetKey));
+  // Unrecognized target/alias should never silently turn into a different relation.
+  if (!alias && !targetKey || matches.length !== 1) return null;
+  return { relation: matches[0], model: models.get(matches[0].targetKey), options: object };
+}
+function addEagerLoadedAssociations(project, sourceFile, model, schema, include, depth = 0, chain = new Set()) {
+  if (!include || depth >= 10) return schema;
+  const parentKey = modelIdentity(model);
+  if (!parentKey) return schema;
+  const properties = { ...(schema.properties ?? {}) };
+  const required = new Set(schema.required ?? []);
+  for (const { file, node } of collectIncludeNodes(project, sourceFile, include)) {
+    const hit = includedAssociation(project, parentKey, file, node);
+    if (!hit) continue;
+    const { relation, model: target, options } = hit;
+    if (!target || !relation.alias) continue;
+    // Explicit includes form an acyclic selection tree in normal queries;
+    // guard unusual cyclic/self-referential selections anyway.
+    const edge = `${parentKey}:${relation.alias}`;
+    if (chain.has(edge)) continue;
+    const nested = options && objectProperty(options, "include");
+    const next = new Set(chain); next.add(edge);
+    let child = sequelizeDefinitionShape(project, target.file, target.node, file, options);
+    child = addEagerLoadedAssociations(project, file, target, child, nested, depth + 1, next);
+    let property = pluralRelations.has(relation.kind) ? { type: "array", items: child } : child;
+    const mandatory = options && project.staticValue(file, objectProperty(options, "required")) === true;
+    if (!pluralRelations.has(relation.kind) && !mandatory) property = { anyOf: [property, { type: "null" }] };
+    properties[relation.alias] = property;
+    required.add(relation.alias);
+  }
+  return { ...schema, ...(Object.keys(properties).length ? { type: "object", properties } : {}),
+    ...(required.size ? { required: [...required] } : {}) };
+}
 function sequelizeModelShape(project, file, call) {
   const source = call.expression.expression;
   const model = sequelizeDefinition(project, file, source);
   if (!model) return {};
-  return sequelizeDefinitionShape(project, model.file, model.node, file, call.arguments[0]);
+  const queryArgument = member(call.expression) === "findByPk" ? call.arguments[1] : call.arguments[0];
+  const query = resolveOptionExpression(project, file, queryArgument);
+  const queryFile = query?.file ?? file;
+  const queryNode = query?.node;
+  const base = sequelizeDefinitionShape(project, model.file, model.node, queryFile, queryNode);
+  return addEagerLoadedAssociations(project, queryFile, model, base,
+    queryNode && ts.isObjectLiteralExpression(queryNode) ? objectProperty(queryNode, "include") : null);
 }
 // Object.fromEntries may expose model fields via computed keys. Only infer
 // their types when one local Sequelize definition matches all of the keys.

@@ -1,6 +1,6 @@
 # express-swagger-docauto
 
-Automatically generate OpenAPI documentation for Express applications.
+Automatically generate OpenAPI documentation for Express with Sequelize applications.
 
 ## Installation
 

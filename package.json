@@ -1,6 +1,6 @@
 {
   "name": "express-swagger-docauto",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Project-wide source analysis to generate OpenAPI for Express without handwritten schemas",
   "type": "module",
   "main": "./dist/index.js",
@@ -21,6 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "build": "node scripts/build.js",
     "prepack": "node scripts/build.js"
   },

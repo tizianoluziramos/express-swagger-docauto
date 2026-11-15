@@ -184,6 +184,53 @@ export class Project {
     if (wildcard?.file) return this.exported(wildcard.file, exportedName, seen);
     return null;
   }
+  externalCallSchema(file, call) {
+    let root = unwrap(call.expression);
+    while (ts.isPropertyAccessExpression(root) || ts.isElementAccessExpression(root)) root = unwrap(root.expression);
+    if (!ts.isIdentifier(root)) return null;
+    const imported = this.file(file)?.imports.get(root.text);
+    if (!imported || imported.file || imported.spec.startsWith(".")) return null;
+    // Read installed declarations, never import/execute the dependency or app.
+    // This is lazy: most schemas are resolved using our much cheaper AST pass.
+    if (!this.typeProgram) {
+      this.typeProgram = ts.createProgram([...this.cache.keys()], {
+        ...this.compilerOptions, allowJs: true, checkJs: false, noEmit: true,
+        skipLibCheck: true, strictNullChecks: true, types: [],
+        module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      });
+      this.typeChecker = this.typeProgram.getTypeChecker();
+    }
+    const source = this.typeProgram.getSourceFile(file);
+    if (!source) return null;
+    let target = null;
+    const find = (node) => {
+      if (node.pos === call.pos && node.end === call.end && ts.isCallExpression(node)) target = node;
+      else if (node.pos <= call.pos && node.end >= call.end) ts.forEachChild(node, find);
+    };
+    find(source);
+    if (!target) return null;
+    const checker = this.typeChecker;
+    const convert = (type, depth = 0) => {
+      if (!type || depth > 8 || type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter)) return null;
+      if (type.flags & ts.TypeFlags.StringLike) return { type: "string" };
+      if (type.flags & ts.TypeFlags.NumberLike) return { type: "number" };
+      if (type.flags & ts.TypeFlags.BooleanLike) return { type: "boolean" };
+      if (type.flags & ts.TypeFlags.Null) return { type: "null" };
+      if (type.isUnion()) {
+        const values = type.types.map((part) => convert(part, depth + 1));
+        // A partially unknown union cannot safely be narrowed.
+        if (values.some((part) => !part)) return null;
+        const unique = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
+        return unique.length === 1 ? unique[0] : { anyOf: unique };
+      }
+      if (checker.isArrayType(type)) {
+        const item = convert(checker.getTypeArguments(type)[0], depth + 1);
+        return item ? { type: "array", items: item } : null;
+      }
+      return null;
+    };
+    return convert(checker.getAwaitedType(checker.getTypeAtLocation(target)));
+  }
   knownMissingEnvironment(file, expression, depth = 0) {
     if (!expression || depth > 18) return false;
     const node = unwrap(expression);

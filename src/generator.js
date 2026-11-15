@@ -182,8 +182,20 @@ function operationFor(route, report, schemeRegistry, errorHandling) {
   if (Object.keys(requirements).length) operation.security = [requirements];
   const errors = new Set(report.errors);
   if (report.dto.length && errorHandling.zodBadRequest) errors.add(400);
-  operation.responses = documentedResponses(report.successes, errors, route.method, errorHandling.errorSchema, report.errorMessages, errorHandling);
+  operation.responses = documentedResponses(report.successes, errors, route.method, errorHandling.errorSchema, report.errorMessages,
+    { ...errorHandling, zodBadRequest: errorHandling.zodBadRequest && report.dto.length > 0 });
   return operation;
+}
+function unknownResponseFields(schema, field = "$") {
+  if (!schema || typeof schema !== "object") return [];
+  if (!Object.keys(schema).length) return [field];
+  const unknown = [];
+  for (const [key, value] of Object.entries(schema.properties ?? {})) unknown.push(...unknownResponseFields(value, `${field}.${key}`));
+  if (schema.items) unknown.push(...unknownResponseFields(schema.items, `${field}[]`));
+  for (const kind of ["anyOf", "oneOf", "allOf"]) for (const part of schema[kind] ?? []) {
+    unknown.push(...unknownResponseFields(part, field));
+  }
+  return [...new Set(unknown)];
 }
 export async function generateOpenApi({
   root = process.cwd(), entry = "src/app.js", title, version, strict = false, loadSchemas = true,
@@ -201,6 +213,10 @@ export async function generateOpenApi({
   for (const route of routes) {
     const report = analyzeRoute(project, route);
     const key = normalize(route.path);
+    for (const response of report.successes) for (const field of unknownResponseFields(response.schema)) {
+      diagnostics.push({ level: "warning", code: "UNRESOLVED_RESPONSE_SCHEMA",
+        message: `Response ${response.status} of ${route.method.toUpperCase()} ${key} has an unknown schema at ${field} (${route.location})` });
+    }
     if (!document.paths[key]) document.paths[key] = {};
     const methods = route.method === "all" ? supportedMethods : [route.method];
     for (const method of methods) {

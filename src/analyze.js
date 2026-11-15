@@ -10,9 +10,9 @@ const empty = () => ({});
 const unique = (items) => [...new Set(items)];
 const unwrapAwait = (expr) => { let node = unwrap(expr); while (node && ts.isAwaitExpression(node)) node = unwrap(node.expression); return node; };
 
-function scopeOf(fn) {
-  const binds = new Map();
-  const destructured = new Map();
+function scopeOf(fn, parent) {
+  const binds = new Map(parent?.binds);
+  const destructured = new Map(parent?.destructured);
   walk(fn.body ?? fn, (node) => {
     if (ts.isVariableDeclaration(node) && node.initializer) {
       if (ts.isIdentifier(node.name)) binds.set(node.name.text, node.initializer);
@@ -27,7 +27,112 @@ function scopeOf(fn) {
     const param = fn.parameters?.[index]?.name;
     return param && ts.isIdentifier(param) ? param.text : fallback;
   };
-  return { binds, destructured, req: parameterName(0, "req"), res: parameterName(1, "res") };
+  return { binds, destructured, req: parameterName(0, "req"), res: parameterName(1, "res"),
+    argumentValues: new Map(parent?.argumentValues), argumentExpressions: new Map(parent?.argumentExpressions) };
+}
+// Values belong to an invocation, not just a function declaration. Keep unknown
+// members unknown while preserving known options passed alongside them.
+function scopedValue(project, file, expression, scope, depth = 0) {
+  const node = unwrapAwait(expression);
+  if (!node || depth > 24) return undefined;
+  const calc = (value) => scopedValue(project, file, value, scope, depth + 1);
+  if (ts.isIdentifier(node)) {
+    if (scope.argumentValues?.has(node.text)) return scope.argumentValues.get(node.text);
+    const binding = scope.destructured.get(node.text);
+    if (binding) return calc(binding.source)?.[binding.key];
+    const local = scope.binds.get(node.text);
+    if (local && local !== node) return calc(local);
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    const value = {};
+    for (const prop of node.properties) {
+      if (ts.isSpreadAssignment(prop)) Object.assign(value, calc(prop.expression));
+      else if (ts.isPropertyAssignment(prop) || ts.isShorthandPropertyAssignment(prop)) {
+        const key = propertyName(prop.name);
+        if (key) value[key] = calc(ts.isPropertyAssignment(prop) ? prop.initializer : prop.name);
+      }
+    }
+    return value;
+  }
+  if (ts.isArrayLiteralExpression(node)) return node.elements.map(calc);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const key = member(node) ?? calc(node.argumentExpression);
+    const receiver = calc(node.expression);
+    if (receiver !== undefined && receiver !== null) return receiver[key];
+  }
+  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
+    const value = calc(node.operand);
+    if (value !== undefined) return !value;
+  }
+  if (ts.isBinaryExpression(node)) {
+    const left = calc(node.left);
+    const kind = node.operatorToken.kind;
+    // Three-valued logic: a known false conjunct makes the branch unreachable,
+    // even when its other operand depends on a database result.
+    if (kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+      if (left !== undefined && !left) return left;
+      const right = calc(node.right);
+      return right !== undefined && !right ? right : left !== undefined ? right : undefined;
+    }
+    if (kind === ts.SyntaxKind.BarBarToken) return left !== undefined ? left || calc(node.right) : undefined;
+    const right = calc(node.right);
+    if (left !== undefined && right !== undefined) {
+      if (kind === ts.SyntaxKind.GreaterThanToken) return left > right;
+      if (kind === ts.SyntaxKind.LessThanToken) return left < right;
+      if (kind === ts.SyntaxKind.EqualsEqualsEqualsToken) return left === right;
+      if (kind === ts.SyntaxKind.ExclamationEqualsEqualsToken) return left !== right;
+    }
+  }
+  return project.staticValue(file, node);
+}
+function invocationScope(project, callerFile, fnFile, fn, args, parent, closure) {
+  const scope = scopeOf(fn, closure);
+  const bind = (pattern, value) => {
+    if (ts.isIdentifier(pattern)) scope.argumentValues.set(pattern.text, value);
+    else if (ts.isObjectBindingPattern(pattern)) for (const part of pattern.elements) {
+      if (part.dotDotDotToken) continue;
+      const key = propertyName(part.propertyName ?? part.name);
+      let field = value?.[key];
+      if (field === undefined && part.initializer && value !== undefined && value !== null && !Object.hasOwn(value, key)) {
+        field = scopedValue(project, fnFile, part.initializer, scope);
+      }
+      bind(part.name, field);
+    }
+  };
+  fn.parameters.forEach((parameter, index) => {
+    let value = scopedValue(project, callerFile, args[index], parent);
+    // A default applies to an omitted argument, not an unknown runtime value.
+    if (index >= args.length && parameter.initializer) value = scopedValue(project, fnFile, parameter.initializer, scope);
+    bind(parameter.name, value);
+    if (ts.isIdentifier(parameter.name) && args[index]) {
+      scope.argumentExpressions.set(parameter.name.text, { file: callerFile, node: args[index], scope: parent });
+    }
+  });
+  return scope;
+}
+function functionTarget(project, file, expression, scope, depth = 0) {
+  const node = unwrapAwait(expression);
+  if (!node || depth > 20) return null;
+  if (functionLike(node)) return { file, node, closure: scope };
+  if (ts.isIdentifier(node)) {
+    const argument = scope.argumentExpressions?.get(node.text);
+    if (argument) return functionTarget(project, argument.file, argument.node, argument.scope, depth + 1);
+    const local = scope.binds.get(node.text);
+    if (local && local !== node) return functionTarget(project, file, local, scope, depth + 1);
+  }
+  return project.resolveExpression(file, node);
+}
+function walkReachable(project, file, node, scope, visitor) {
+  if (!node) return;
+  visitor(node);
+  if (ts.isIfStatement(node)) {
+    const condition = scopedValue(project, file, node.expression, scope);
+    walkReachable(project, file, node.expression, scope, visitor);
+    if (condition === undefined || condition) walkReachable(project, file, node.thenStatement, scope, visitor);
+    if (condition === undefined || !condition) walkReachable(project, file, node.elseStatement, scope, visitor);
+    return;
+  }
+  ts.forEachChild(node, (child) => walkReachable(project, file, child, scope, visitor));
 }
 function resolveLocal(project, file, node, scope, depth = 0) {
   node = unwrapAwait(node);
@@ -77,13 +182,37 @@ function returnedObject(project, file, expression, scope, visited = new Set(), d
     if (local && local !== node) return returnedObject(project, file, local, scope, seen, depth + 1);
   }
   if (ts.isCallExpression(node)) {
-    const target = project.resolveExpression(file, node.expression);
+    // Managed Sequelize transactions resolve to the callback's return value.
+    // Do not assume that every third-party callback API has this behavior.
+    if (member(node.expression) === "transaction" && member(node.expression.expression) === "sequelize") {
+      const callback = node.arguments.find((arg) => functionLike(unwrap(arg)));
+      if (callback) {
+        const fn = unwrap(callback);
+        const childScope = scopeOf(fn, scope);
+        const out = [];
+        const visit = (inner) => {
+          if (functionLike(inner)) return;
+          if (ts.isReturnStatement(inner) && inner.expression) out.push(...returnedObject(project, file, inner.expression, childScope, seen, depth + 1));
+          ts.forEachChild(inner, visit);
+        };
+        if (ts.isBlock(fn.body)) visit(fn.body);
+        else out.push(...returnedObject(project, file, fn.body, childScope, seen, depth + 1));
+        return out;
+      }
+    }
+    const target = functionTarget(project, file, node.expression, scope);
     if (target && functionLike(target.node)) {
-      const childScope = scopeOf(target.node);
+      const childScope = invocationScope(project, file, target.file, target.node, node.arguments, scope, target.closure);
       const out = [];
-      walk(target.node.body, (inner) => {
+      if (ts.isArrowFunction(target.node) && !ts.isBlock(target.node.body)) {
+        return returnedObject(project, target.file, target.node.body, childScope, seen, depth + 1);
+      }
+      const visit = (inner) => {
+        if (functionLike(inner)) return;
         if (ts.isReturnStatement(inner) && inner.expression) out.push(...returnedObject(project, target.file, inner.expression, childScope, seen, depth + 1));
-      });
+        ts.forEachChild(inner, visit);
+      };
+      visit(target.node.body);
       return out;
     }
   }
@@ -94,15 +223,15 @@ function returnedObject(project, file, expression, scope, visited = new Set(), d
 function statusValues(project, file, expression, scope, depth = 0) {
   if (!expression || depth > 12) return [];
   const node = unwrapAwait(expression);
-  const known = project.staticValue(file, node);
+  const known = scopedValue(project, file, node, scope);
   if (typeof known === "number" && known >= 100 && known < 600) return [known];
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = member(node) ?? project.staticValue(file, node.argumentExpression);
     if (name === "status" || name === "statusCode") {
       const result = returnedObject(project, file, node.expression, scope);
       return unique(result.flatMap((item) => {
-        const field = item.node.properties.find((p) => ts.isPropertyAssignment(p) && propertyName(p.name) === name);
-        return field ? statusValues(project, item.file, field.initializer, item.scope, depth + 1) : [];
+        const field = objectProperty(item.node, name);
+        return field ? statusValues(project, item.file, field, item.scope, depth + 1) : [];
       }));
     }
     const mapped = phrases.get(names(name));
@@ -113,8 +242,8 @@ function statusValues(project, file, expression, scope, depth = 0) {
       const { source, key } = scope.destructured.get(node.text);
       const results = returnedObject(project, file, source, scope);
       return unique(results.flatMap((item) => {
-        const attr = item.node.properties.find((p) => ts.isPropertyAssignment(p) && propertyName(p.name) === key);
-        return attr ? statusValues(project, item.file, attr.initializer, item.scope, depth + 1) : [];
+        const attr = objectProperty(item.node, key);
+        return attr ? statusValues(project, item.file, attr, item.scope, depth + 1) : [];
       }));
     }
     const bound = scope.binds.get(node.text);
@@ -133,7 +262,7 @@ function textValues(project, file, expression, scope, depth = 0, visited = new S
   const position = `${file}:${node.pos}:${node.end}`;
   if (visited.has(position)) return [];
   const next = new Set(visited); next.add(position);
-  const literal = project.staticValue(file, node);
+  const literal = scopedValue(project, file, node, scope);
   if (typeof literal === "string") return [literal];
   if (ts.isConditionalExpression(node)) {
     return unique([
@@ -144,9 +273,8 @@ function textValues(project, file, expression, scope, depth = 0, visited = new S
   if (ts.isIdentifier(node)) {
     const destructured = scope.destructured.get(node.text);
     if (destructured) return unique(returnedObject(project, file, destructured.source, scope).flatMap((entry) => {
-      const property = entry.node.properties.find((part) =>
-        ts.isPropertyAssignment(part) && propertyName(part.name) === destructured.key);
-      return property ? textValues(project, entry.file, property.initializer, entry.scope, depth + 1, next) : [];
+      const property = objectProperty(entry.node, destructured.key);
+      return property ? textValues(project, entry.file, property, entry.scope, depth + 1, next) : [];
     }));
     const local = scope.binds.get(node.text);
     if (local && local !== node) return textValues(project, file, local, scope, depth + 1, next);
@@ -154,9 +282,8 @@ function textValues(project, file, expression, scope, depth = 0, visited = new S
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = member(node) ?? (ts.isElementAccessExpression(node) ? project.staticValue(file, node.argumentExpression) : null);
     if (typeof name === "string") return unique(returnedObject(project, file, node.expression, scope).flatMap((entry) => {
-      const property = entry.node.properties.find((part) =>
-        ts.isPropertyAssignment(part) && propertyName(part.name) === name);
-      return property ? textValues(project, entry.file, property.initializer, entry.scope, depth + 1, next) : [];
+      const property = objectProperty(entry.node, name);
+      return property ? textValues(project, entry.file, property, entry.scope, depth + 1, next) : [];
     }));
   }
   const resolved = project.resolveExpression(file, node);
@@ -184,15 +311,25 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
   const modelOptions = project.staticValue(modelFile, definition.arguments[2]) ?? {};
   const exclusions = new Set(modelOptions.defaultScope?.attributes?.exclude ?? []);
   let selection = null;
+  let attributes = null;
   const resolvedQuery = resolveOptionExpression(project, sourceFile, query);
   query = resolvedQuery?.node ?? unwrap(query);
   if (query && ts.isObjectLiteralExpression(query)) {
     const attr = query.properties.find((part) => ts.isPropertyAssignment(part) && propertyName(part.name) === "attributes");
     if (attr) {
+      attributes = unwrap(attr.initializer);
       const selected = project.staticValue(resolvedQuery?.file ?? sourceFile, attr.initializer);
       if (Array.isArray(selected)) selection = new Set(selected);
       else if (selected && typeof selected === "object") {
         for (const field of selected.exclude ?? []) exclusions.add(field);
+      }
+      // Computed aliases make staticValue(array/object) unknown. Plain selected
+      // names and exclusions are still recoverable independently.
+      if (ts.isArrayLiteralExpression(attributes)) selection = new Set(attributes.elements
+        .map((part) => project.staticValue(resolvedQuery?.file ?? sourceFile, part)).filter((part) => typeof part === "string"));
+      if (ts.isObjectLiteralExpression(attributes)) {
+        const excluded = project.staticValue(resolvedQuery?.file ?? sourceFile, objectProperty(attributes, "exclude"));
+        for (const field of Array.isArray(excluded) ? excluded : []) exclusions.add(field);
       }
     }
   }
@@ -244,7 +381,51 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
     if (columns[fk.name] || exclusions.has(fk.name) || (selection && !selection.has(fk.name))) continue;
     columns[fk.name] = fk.required ? fk.schema : { anyOf: [fk.schema, { type: "null" }] };
   }
-  return Object.keys(columns).length ? { type: "object", properties: columns } : { type: "object" };
+  const aliases = attributes && (ts.isArrayLiteralExpression(attributes) ? attributes :
+    ts.isObjectLiteralExpression(attributes) ? unwrap(objectProperty(attributes, "include")) : null);
+  if (aliases && ts.isArrayLiteralExpression(aliases)) for (const alias of aliases.elements) {
+    if (!ts.isArrayLiteralExpression(alias) || alias.elements.length !== 2) continue;
+    const queryFile = resolvedQuery?.file ?? sourceFile;
+    const name = project.staticValue(queryFile, alias.elements[1]);
+    if (typeof name !== "string") continue;
+    const expression = unwrap(alias.elements[0]);
+    let inferred = {};
+    if (ts.isCallExpression(expression) && (member(expression.expression) === "col" ||
+      ts.isIdentifier(expression.expression) && expression.expression.text === "col")) {
+      const imported = ts.isIdentifier(expression.expression) ? project.file(queryFile)?.imports.get(expression.expression.text) :
+        project.file(queryFile)?.imports.get(expression.expression.expression?.text);
+      const path = project.staticValue(queryFile, expression.arguments[0]);
+      if (imported?.spec === "sequelize" && typeof path === "string") {
+        const fragments = path.split(".");
+        const field = fragments.pop();
+        let key = identity;
+        let target = null;
+        let include = query && objectProperty(query, "include");
+        let nullable = false;
+        const { graph, models } = associationsFor(project);
+        for (const fragment of fragments) {
+          const relation = graph.get(key)?.find((entry) => entry.alias === fragment);
+          target = relation && models.get(relation.targetKey);
+          if (!target) break;
+          const selection = collectIncludeNodes(project, queryFile, include)
+            .map((entry) => ({ ...entry, hit: includedAssociation(project, key, entry.file, entry.node) }))
+            .find((entry) => entry.hit?.relation.alias === fragment);
+          nullable ||= !selection || !requiredInclude(project, selection.file, selection.hit.options);
+          include = selection?.hit.options && objectProperty(selection.hit.options, "include");
+          key = relation.targetKey;
+        }
+        inferred = fragments.length && target
+          ? sequelizeDefinitionShape(project, target.file, target.node).properties?.[field] ?? {}
+          : !fragments.length ? columns[field] ?? {} : {};
+        if (nullable && Object.keys(inferred).length && !inferred.anyOf?.some((part) => part.type === "null")) {
+          inferred = { anyOf: [inferred, { type: "null" }] };
+        }
+      }
+    }
+    columns[name] = inferred;
+  }
+  return { type: "object", properties: columns,
+    ...(Object.keys(columns).length ? { required: Object.keys(columns) } : {}) };
 }
 // Cache wrappers are transparent to Sequelize consumers. Only unwrap an
 // `init(model)` call when its receiver originates from a known cache package;
@@ -371,7 +552,9 @@ function foreignKeysFor(project, key) {
   return columns;
 }
 function objectProperty(node, name) {
-  return node?.properties?.find((prop) => ts.isPropertyAssignment(prop) && propertyName(prop.name) === name)?.initializer;
+  const prop = node?.properties?.find((prop) =>
+    (ts.isPropertyAssignment(prop) || ts.isShorthandPropertyAssignment(prop)) && propertyName(prop.name) === name);
+  return prop && (ts.isShorthandPropertyAssignment(prop) ? prop.name : prop.initializer);
 }
 // Follow constant, imported and helper-returned query/include expressions,
 // but never execute project code. An expression can come from another file.
@@ -464,6 +647,11 @@ function includedAssociation(project, parentKey, file, includeNode) {
   if (!alias && !targetKey || matches.length !== 1) return null;
   return { relation: matches[0], model: models.get(matches[0].targetKey), options: object };
 }
+function requiredInclude(project, file, options) {
+  if (!options) return false;
+  const required = project.staticValue(file, objectProperty(options, "required"));
+  return required === true || required !== false && Boolean(objectProperty(options, "where"));
+}
 function addEagerLoadedAssociations(project, sourceFile, model, schema, include, depth = 0, chain = new Set()) {
   if (!include || depth >= 10) return schema;
   const parentKey = modelIdentity(model);
@@ -475,6 +663,9 @@ function addEagerLoadedAssociations(project, sourceFile, model, schema, include,
     if (!hit) continue;
     const { relation, model: target, options } = hit;
     if (!target || !relation.alias) continue;
+    // An include used only for a JOIN/flattened column is not serialized.
+    const selected = options && project.staticValue(file, objectProperty(options, "attributes"));
+    if (Array.isArray(selected) && selected.length === 0) continue;
     // Explicit includes form an acyclic selection tree in normal queries;
     // guard unusual cyclic/self-referential selections anyway.
     const edge = `${parentKey}:${relation.alias}`;
@@ -484,7 +675,7 @@ function addEagerLoadedAssociations(project, sourceFile, model, schema, include,
     let child = sequelizeDefinitionShape(project, target.file, target.node, file, options);
     child = addEagerLoadedAssociations(project, file, target, child, nested, depth + 1, next);
     let property = pluralRelations.has(relation.kind) ? { type: "array", items: child } : child;
-    const mandatory = options && project.staticValue(file, objectProperty(options, "required")) === true;
+    const mandatory = requiredInclude(project, file, options);
     if (!pluralRelations.has(relation.kind) && !mandatory) property = { anyOf: [property, { type: "null" }] };
     properties[relation.alias] = property;
     required.add(relation.alias);
@@ -549,7 +740,7 @@ function shape(project, file, expression, scope, depth = 0) {
       if (!key) continue;
       const expression = ts.isShorthandPropertyAssignment(prop) ? prop.name : prop.initializer;
       const inferred = shape(project, file, expression, scope, depth + 1);
-      const explicit = key === "status"
+      const explicit = key === "status" || key === "statusCode"
         ? knownFieldSchema("status", statusValues(project, file, expression, scope))
         : key === "message" ? knownFieldSchema("message", textValues(project, file, expression, scope)) : null;
       properties[key] = explicit ?? inferred;
@@ -598,6 +789,10 @@ function shape(project, file, expression, scope, depth = 0) {
   if (ts.isIdentifier(node)) {
     const incoming = scope.argumentSchemas?.get(node.text);
     if (incoming && Object.keys(incoming).length) return incoming;
+    const incomingValue = scope.argumentValues?.get(node.text);
+    if (typeof incomingValue === "string") return { type: "string" };
+    if (typeof incomingValue === "number") return { type: Number.isInteger(incomingValue) ? "integer" : "number" };
+    if (typeof incomingValue === "boolean") return { type: "boolean" };
     if (scope.destructured.has(node.text)) {
       const { source, key } = scope.destructured.get(node.text);
       const sourceValue = unwrapAwait(source);
@@ -675,9 +870,9 @@ function shape(project, file, expression, scope, depth = 0) {
     }
     // In addition to object literals, follow direct helper returns such as
     // `return "active"` or `return Object.fromEntries(...)`.
-    const target = project.resolveExpression(file, node.expression);
+    const target = functionTarget(project, file, node.expression, scope);
     if (target && functionLike(target.node)) {
-      const childScope = scopeOf(target.node);
+      const childScope = invocationScope(project, file, target.file, target.node, node.arguments, scope, target.closure);
       childScope.argumentSchemas = new Map();
       for (let index = 0; index < target.node.parameters.length; index++) {
         const parameter = target.node.parameters[index].name;
@@ -691,7 +886,8 @@ function shape(project, file, expression, scope, depth = 0) {
         if (ts.isReturnStatement(child) && child.expression) expressions.push(child.expression);
         ts.forEachChild(child, visit);
       };
-      visit(target.node.body ?? target.node);
+      if (ts.isArrowFunction(target.node) && !ts.isBlock(target.node.body)) expressions.push(target.node.body);
+      else visit(target.node.body ?? target.node);
       if (expressions.length) {
         const values = expressions.map((value) => shape(project, target.file, value, childScope, depth + 1));
         const meaningful = values.filter((value) => Object.keys(value).length);
@@ -707,6 +903,8 @@ function shape(project, file, expression, scope, depth = 0) {
       const variants = returns.map((value) => shape(project, value.file, value.node, value.scope, depth + 1));
       return variants.length === 1 ? variants[0] : { anyOf: variants };
     }
+    const declared = project.externalCallSchema(file, node);
+    if (declared) return declared;
   }
   if (statusValues(project, file, node, scope).length) return { type: "integer" };
   if (ts.isPropertyAccessExpression(node) && member(node) === "status") return { type: "integer" };
@@ -719,13 +917,22 @@ function fnBodies(project, file, expr, depth = 0) {
   if (ts.isCallExpression(current)) {
     const invoked = project.resolveExpression(file, current.expression);
     if (invoked && functionLike(invoked.node)) {
-      const all = [{ file: invoked.file, fn: invoked.node }];
+      const scope = invocationScope(project, file, invoked.file, invoked.node, current.arguments, scopeOf(invoked.node));
+      const all = [];
       walk(invoked.node.body, (node) => {
         if (ts.isReturnStatement(node) && node.expression) {
-          if (functionLike(node.expression)) all.push({ file: invoked.file, fn: node.expression });
+          const returned = unwrap(node.expression);
+          let fn = functionLike(returned) ? returned : null;
+          if (ts.isIdentifier(returned)) walk(invoked.node.body, (candidate) => {
+            if (ts.isFunctionDeclaration(candidate) && candidate.name?.text === returned.text) fn = candidate;
+          });
+          if (fn) {
+            const child = scopeOf(fn, scope);
+            all.push({ file: invoked.file, fn, scope: child });
+          }
         }
       });
-      return all;
+      return all.length ? all : [{ file: invoked.file, fn: invoked.node, scope }];
     }
   }
   const ref = project.resolveExpression(file, current);
@@ -735,7 +942,7 @@ function fnBodies(project, file, expr, depth = 0) {
 function securityOf(project, file, fn, scope, errors) {
   if (![401, 403].some((code) => errors.has(code))) return [];
   const found = [];
-  walk(fn.body ?? fn, (node) => {
+  walkReachable(project, file, fn.body ?? fn, scope, (node) => {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const source = unwrap(node.expression);
       if (!ts.isPropertyAccessExpression(source) && !ts.isElementAccessExpression(source)) return;
@@ -763,7 +970,7 @@ function outputOf(project, file, fn, scope) {
   const dto = [];
   const securityCandidates = [];
   const warned = new Set();
-  walk(fn.body ?? fn, (node) => {
+  walkReachable(project, file, fn.body ?? fn, scope, (node) => {
     if (ts.isThrowStatement(node) && node.expression) {
       const exception = unwrap(node.expression);
       if (ts.isNewExpression(exception) || ts.isCallExpression(exception)) {
@@ -842,15 +1049,16 @@ function outputOf(project, file, fn, scope) {
 function analyzeExpression(project, item, depthLimit = 15, isEndpoint = false) {
   const results = { responses: [], errors: new Set(), errorMessages: new Map(), dto: [], securityCandidates: [] };
   const processed = new Set();
-  const analyzeFn = (file, fn, depth) => {
+  const analyzeFn = (file, fn, depth, scope = scopeOf(fn)) => {
     if (depth > depthLimit || processed.size > 350) {
       project.diagnostics.push({ level: "warning", code: "CALL_DEPTH", message: `Call-graph traversal limit reached at ${file}` });
       return;
     }
-    const key = `${file}:${fn.pos}:${fn.end}`;
+    const argumentsKey = [...(scope.argumentExpressions ?? [])].map(([name, value]) =>
+      `${name}:${value.file}:${value.node.pos}:${value.node.end}`);
+    const key = `${file}:${fn.pos}:${fn.end}:${JSON.stringify([...(scope.argumentValues ?? [])])}:${argumentsKey.join("|")}`;
     if (processed.has(key)) return;
     processed.add(key);
-    const scope = scopeOf(fn);
     const details = outputOf(project, file, fn, scope);
     results.responses.push(...details.responses);
     for (const error of details.errors) results.errors.add(error);
@@ -861,16 +1069,19 @@ function analyzeExpression(project, item, depthLimit = 15, isEndpoint = false) {
     results.dto.push(...details.dto);
     results.securityCandidates.push(...details.securityCandidates);
     const calls = [];
-    walk(fn.body ?? fn, (node) => {
+    walkReachable(project, file, fn.body ?? fn, scope, (node) => {
       if (ts.isCallExpression(node)) calls.push(node);
     });
     for (const call of calls) {
       if (call.expression === fn || ts.isIdentifier(call.expression) && ["next", scope.res, scope.req].includes(call.expression.text)) continue;
-      const symbol = project.resolveExpression(file, call.expression);
-      if (symbol && functionLike(symbol.node)) analyzeFn(symbol.file, symbol.node, depth + 1);
+      const symbol = functionTarget(project, file, call.expression, scope);
+      if (symbol && functionLike(symbol.node)) {
+        analyzeFn(symbol.file, symbol.node, depth + 1,
+          invocationScope(project, file, symbol.file, symbol.node, call.arguments, scope, symbol.closure));
+      }
     }
   };
-  for (const { file, fn } of fnBodies(project, item.file, item.node)) analyzeFn(file, fn, 0);
+  for (const { file, fn, scope } of fnBodies(project, item.file, item.node)) analyzeFn(file, fn, 0, scope);
   return results;
 }
 export function analyzeRoute(project, route) {

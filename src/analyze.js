@@ -305,6 +305,38 @@ function knownFieldSchema(kind, values) {
 // Infer the columns selected by a Sequelize query, including association-created
 // foreign keys. Eager-loaded associations are expanded separately and only when
 // an explicit include is present in the query.
+function sequelizeJsonValidationShape(project, file, settings) {
+  const validation = resolveOptionExpression(project, file, objectProperty(settings, "validate"));
+  if (!validation || !ts.isObjectLiteralExpression(validation.node)) return null;
+  const schemas = [];
+  for (const entry of validation.node.properties) {
+    let validator = entry;
+    let validatorFile = validation.file;
+    if (ts.isPropertyAssignment(entry) || ts.isShorthandPropertyAssignment(entry)) {
+      const resolved = project.resolveExpression(validatorFile,
+        ts.isPropertyAssignment(entry) ? entry.initializer : entry.name);
+      validator = resolved?.node ?? (ts.isPropertyAssignment(entry) ? unwrap(entry.initializer) : null);
+      validatorFile = resolved?.file ?? validatorFile;
+    }
+    if (!functionLike(validator) || !validator.body || !ts.isBlock(validator.body)) continue;
+    const input = validator.parameters[0]?.name;
+    if (!input || !ts.isIdentifier(input)) continue;
+    // Only unconditional, throwing parse calls establish a field constraint.
+    // safeParse(), conditional checks and nested callbacks do not guarantee it.
+    for (const statement of validator.body.statements) {
+      if (!ts.isExpressionStatement(statement) && !ts.isReturnStatement(statement)) continue;
+      const call = unwrap(statement.expression);
+      if (!call || !ts.isCallExpression(call) || member(call.expression) !== "parse") continue;
+      const argument = unwrap(call.arguments[0]);
+      if (!argument || !ts.isIdentifier(argument) || argument.text !== input.text) continue;
+      const schema = schemaFromExpression(project, validatorFile, call.expression.expression);
+      if (schema && Object.keys(schema).length) schemas.push(schema);
+    }
+  }
+  if (!schemas.length) return null;
+  return schemas.length === 1 ? schemas[0] : { allOf: schemas };
+}
+
 function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = modelFile, query = null) {
   const declarations = unwrap(definition.arguments[1]);
   if (!declarations || !ts.isObjectLiteralExpression(declarations)) return {};
@@ -347,7 +379,7 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
     if (ts.isCallExpression(value)) value = unwrap(value.expression);
     let datatype = member(value);
     if (datatype === "UNSIGNED" || datatype === "ZEROFILL") datatype = member(value.expression);
-    const col = {
+    let col = {
       UUID: { type: "string", format: "uuid" }, UUIDV4: { type: "string", format: "uuid" },
       STRING: { type: "string" }, TEXT: { type: "string" }, CHAR: { type: "string" },
       ENUM: { type: "string" },
@@ -357,6 +389,9 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
       JSON: {}, JSONB: {}, BLOB: { type: "string", format: "byte" },
     }[datatype];
     if (!col) continue;
+    if (datatype === "JSON" || datatype === "JSONB") {
+      col = sequelizeJsonValidationShape(project, modelFile, settings) ?? col;
+    }
     if (ts.isCallExpression(originalType)) {
       if (["STRING", "CHAR"].includes(datatype)) {
         const length = project.staticValue(modelFile, originalType.arguments[0]);

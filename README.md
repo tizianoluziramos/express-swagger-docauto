@@ -29,6 +29,11 @@ managed Sequelize transactions, middleware options, and selected Sequelize
 columns and associations. Installed dependency declarations can resolve
 primitive return types, including awaited promises, without executing the app.
 
+Sequelize JSON and JSONB fields inherit their structure from unconditional
+Zod `schema.parse(value)` calls in attribute validators, including eager-loaded
+associations. No separate response DTO or handwritten OpenAPI schema is needed.
+Conditional validation and `safeParse()` calls do not establish a field schema.
+
 Static analysis cannot guarantee every runtime response. Dynamic code, external
 service failures, and missing dependency types may require explicit contracts.
 Unresolved response fields produce `UNRESOLVED_RESPONSE_SCHEMA` warnings.

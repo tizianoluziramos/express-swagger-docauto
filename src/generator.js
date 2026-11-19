@@ -71,7 +71,7 @@ function asParameters(schema, location) {
 function discoverGlobalErrorHandling(project, entry) {
   const sourceFile = path.resolve(project.root, entry);
   const source = project.file(sourceFile);
-  const handling = { zodBadRequest: false, zodMessage: null, internalMessage: null, errorSchema: null };
+  const handling = { zodBadRequest: false, zodMessage: null, internalMessage: null, errorSchema: null, dynamicStatus: false };
   if (!source) return handling;
   walk(source.ast, (node) => {
     if (!ts.isCallExpression(node) || member(node.expression) !== "use") return;
@@ -83,7 +83,23 @@ function discoverGlobalErrorHandling(project, entry) {
       if (content.includes("ZodError") && content.includes("BAD_REQUEST")) handling.zodBadRequest = true;
       if (content.includes('"Validation failed"')) handling.zodMessage = "Validation failed";
       if (content.includes('"Internal Server Error"')) handling.internalMessage = "Internal Server Error";
+      const bindings = new Map();
       walk(fn.body, (inner) => {
+        if (ts.isVariableDeclaration(inner) && ts.isIdentifier(inner.name) && inner.initializer) bindings.set(inner.name.text, inner.initializer);
+      });
+      const dependsOnErrorStatus = (value, seen = new Set()) => {
+        if (!value || seen.has(value)) return false;
+        seen.add(value);
+        if (ts.isIdentifier(value) && bindings.has(value.text)) return dependsOnErrorStatus(bindings.get(value.text), seen);
+        if ((ts.isPropertyAccessExpression(value) || ts.isElementAccessExpression(value)) &&
+          ts.isIdentifier(value.expression) && value.expression.text === fn.parameters[0].name.getText() &&
+          ["status", "statusCode"].includes(member(value))) return true;
+        let found = false;
+        ts.forEachChild(value, (child) => { if (dependsOnErrorStatus(child, seen)) found = true; });
+        return found;
+      };
+      walk(fn.body, (inner) => {
+        if (ts.isCallExpression(inner) && member(inner.expression) === "status" && dependsOnErrorStatus(inner.arguments[0])) handling.dynamicStatus = true;
         if (!ts.isCallExpression(inner) || member(inner.expression) !== "json") return;
         const body = inner.arguments[0];
         if (!body || !ts.isObjectLiteralExpression(body)) return;
@@ -106,15 +122,30 @@ function documentedResponses(known, errors, method, errorSchema, errorMessages, 
   const groups = new Map();
   for (const item of known) {
     if (!groups.has(item.status)) groups.set(item.status, []);
-    groups.get(item.status).push(item.schema);
+    groups.get(item.status).push(item);
   }
   for (const [status, variants] of groups) {
-    const schemas = [...new Map(variants.filter(Boolean).map((value) => [JSON.stringify(value), value])).values()];
+    const content = {};
+    const headers = {};
+    for (const variant of variants) {
+      for (const [name, value] of Object.entries(variant.headers ?? {})) {
+        if (!headers[name]) headers[name] = value;
+        else if (JSON.stringify(headers[name].schema) !== JSON.stringify(value.schema)) {
+          headers[name] = { schema: { anyOf: [headers[name].schema, value.schema] } };
+        }
+      }
+      if (!variant.schema) continue;
+      const mediaType = variant.mediaType ?? "application/json";
+      (content[mediaType] ??= []).push(variant.schema);
+    }
+    for (const [mediaType, values] of Object.entries(content)) {
+      const schemas = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
+      content[mediaType] = { schema: schemas.length === 1 ? schemas[0] : { anyOf: schemas } };
+    }
     output[String(status)] = {
       description: statusText(status),
-      ...(!(status === 204 || method === "head") && schemas.length ? {
-        content: { "application/json": { schema: schemas.length === 1 ? schemas[0] : { oneOf: schemas } } },
-      } : {}),
+      ...(Object.keys(headers).length ? { headers } : {}),
+      ...(!(status < 200 || [204, 205, 304].includes(status) || method === "head") && Object.keys(content).length ? { content } : {}),
     };
   }
   if (!groups.size) output.default = { description: "Response could not be determined statically" };
@@ -139,9 +170,22 @@ function documentedResponses(known, errors, method, errorSchema, errorMessages, 
         };
       }
     }
+    const response = output[String(status)];
+    if (response && errorHandling.thrownErrors.has(status) && schema) {
+      response.content ??= {};
+      const previous = response.content["application/json"]?.schema;
+      response.content["application/json"] = { schema: previous && JSON.stringify(previous) !== JSON.stringify(schema)
+        ? { anyOf: [previous, schema] } : schema };
+    }
     output[String(status)] ??= {
       description: statusText(status),
       ...(schema ? { content: { "application/json": { schema } } } : {}),
+    };
+  }
+  if (groups.size && errorSchema && errorHandling.dynamicStatus) {
+    output.default = {
+      description: "Other error statuses forwarded to the application's error middleware, including dependency failures.",
+      content: { "application/json": { schema: structuredClone(errorSchema) } },
     };
   }
   return output;
@@ -182,18 +226,29 @@ function operationFor(route, report, schemeRegistry, errorHandling) {
   if (Object.keys(requirements).length) operation.security = [requirements];
   const errors = new Set(report.errors);
   if (report.dto.length && errorHandling.zodBadRequest) errors.add(400);
-  operation.responses = documentedResponses(report.successes, errors, route.method, errorHandling.errorSchema, report.errorMessages,
-    { ...errorHandling, zodBadRequest: errorHandling.zodBadRequest && report.dto.length > 0 });
+  operation.responses = documentedResponses(report.responses, errors, route.method, errorHandling.errorSchema, report.errorMessages,
+    { ...errorHandling, thrownErrors: new Set([...report.thrownErrors, ...(report.dto.length && errorHandling.zodBadRequest ? [400] : [])]),
+      zodBadRequest: errorHandling.zodBadRequest && report.dto.length > 0 });
   return operation;
 }
-function unknownResponseFields(schema, field = "$") {
+function unknownResponseFields(schema, field = "$", components = {}, seen = new Set()) {
   if (!schema || typeof schema !== "object") return [];
-  if (!Object.keys(schema).length) return [field];
+  if (!Object.keys(schema).some((key) => !["description", "deprecated", "title", "example", "examples"].includes(key))) return [field];
+  if (schema.$ref?.startsWith("#/components/schemas/")) {
+    if (seen.has(schema.$ref)) return [];
+    const next = new Set(seen); next.add(schema.$ref);
+    const target = components[schema.$ref.slice("#/components/schemas/".length)];
+    return target ? unknownResponseFields(target, field, components, next) : [field];
+  }
   const unknown = [];
-  for (const [key, value] of Object.entries(schema.properties ?? {})) unknown.push(...unknownResponseFields(value, `${field}.${key}`));
-  if (schema.items) unknown.push(...unknownResponseFields(schema.items, `${field}[]`));
+  for (const [key, value] of Object.entries(schema.properties ?? {})) unknown.push(...unknownResponseFields(value, `${field}.${key}`, components, seen));
+  if (schema.items && schema.maxItems !== 0) unknown.push(...unknownResponseFields(schema.items, `${field}[]`, components, seen));
+  for (const [index, value] of (schema.prefixItems ?? []).entries()) unknown.push(...unknownResponseFields(value, `${field}[${index}]`, components, seen));
+  if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+    unknown.push(...unknownResponseFields(schema.additionalProperties, `${field}.*`, components, seen));
+  }
   for (const kind of ["anyOf", "oneOf", "allOf"]) for (const part of schema[kind] ?? []) {
-    unknown.push(...unknownResponseFields(part, field));
+    unknown.push(...unknownResponseFields(part, field, components, seen));
   }
   return [...new Set(unknown)];
 }
@@ -213,7 +268,7 @@ export async function generateOpenApi({
   for (const route of routes) {
     const report = analyzeRoute(project, route);
     const key = normalize(route.path);
-    for (const response of report.successes) for (const field of unknownResponseFields(response.schema)) {
+    for (const response of report.responses.filter((item) => route.method !== "head" && item.status >= 200 && ![204, 205, 304].includes(item.status))) for (const field of unknownResponseFields(response.schema, "$", project.externalTypeSchemas?.schemas)) {
       diagnostics.push({ level: "warning", code: "UNRESOLVED_RESPONSE_SCHEMA",
         message: `Response ${response.status} of ${route.method.toUpperCase()} ${key} has an unknown schema at ${field} (${route.location})` });
     }
@@ -225,7 +280,9 @@ export async function generateOpenApi({
     }
     if (!report.successes.length) diagnostics.push({ level: "warning", code: "UNKNOWN_RESPONSE", message: `Response of ${route.method.toUpperCase()} ${key} cannot be fully inferred` });
   }
-  if (!Object.keys(document.components.securitySchemes).length) delete document.components;
+  if (!Object.keys(document.components.securitySchemes).length) delete document.components.securitySchemes;
+  if (Object.keys(project.externalTypeSchemas?.schemas ?? {}).length) document.components.schemas = project.externalTypeSchemas.schemas;
+  if (!Object.keys(document.components).length) delete document.components;
   if (strict && diagnostics.some((issue) => issue.level === "warning" || issue.level === "error")) {
     const sample = diagnostics.slice(0, 10).map((item) => `[${item.code}] ${item.message}`).join("\n");
     throw new Error(`Source documentation inference is incomplete:\n${sample}`);

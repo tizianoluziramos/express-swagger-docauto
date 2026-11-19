@@ -17,7 +17,8 @@ export interface OpenApiDocument {
   servers: Array<{ url: string }>;
   paths: Record<string, Record<string, unknown>>;
   components?: {
-    securitySchemes: Record<string, unknown>;
+    securitySchemes?: Record<string, unknown>;
+    schemas?: Record<string, unknown>;
   };
 }
 

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseEnv } from "node:util";
 import ts from "typescript";
+import { TypeSchemas } from "./types.js";
 
 const extensions = new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"]);
 const ignored = new Set(["node_modules", ".git", ".next", "dist", "build", "coverage", "vendor", ".turbo", ".yarn", "__tests__", "test", "tests"]);
@@ -185,51 +186,48 @@ export class Project {
     return null;
   }
   externalCallSchema(file, call) {
-    let root = unwrap(call.expression);
-    while (ts.isPropertyAccessExpression(root) || ts.isElementAccessExpression(root)) root = unwrap(root.expression);
-    if (!ts.isIdentifier(root)) return null;
-    const imported = this.file(file)?.imports.get(root.text);
-    if (!imported || imported.file || imported.spec.startsWith(".")) return null;
     // Read installed declarations, never import/execute the dependency or app.
+    // The receiver may be an instance imported through a local config/barrel.
     // This is lazy: most schemas are resolved using our much cheaper AST pass.
     if (!this.typeProgram) {
-      this.typeProgram = ts.createProgram([...this.cache.keys()], {
+      const options = {
         ...this.compilerOptions, allowJs: true, checkJs: false, noEmit: true,
-        skipLibCheck: true, strictNullChecks: true, types: [],
+        skipLibCheck: true, strictNullChecks: true, types: [], maxNodeModuleJsDepth: 2,
         module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      };
+      const host = ts.createCompilerHost(options);
+      const moduleCache = ts.createModuleResolutionCache(this.root, host.getCanonicalFileName, options);
+      host.resolveModuleNameLiterals = (literals, from, redirect, compilerOptions, source) => literals.map((literal) => {
+        // Share the AST resolver's aliases (including #/*). Preserve TS's
+        // import/require resolution mode for conditional dependency exports.
+        const local = !literal.text.startsWith(".") && !from.replaceAll("\\", "/").includes("/node_modules/")
+          ? this.resolveImport(from, literal.text) : null;
+        if (local) {
+          const extension = Object.values(ts.Extension).sort((a, b) => b.length - a.length).find((ext) => local.endsWith(ext)) ?? ts.Extension.Js;
+          return { resolvedModule: { resolvedFileName: local, extension, isExternalLibraryImport: false } };
+        }
+        return ts.resolveModuleName(literal.text, from, compilerOptions, host, moduleCache, redirect,
+          source ? ts.getModeForUsageLocation(source, literal, compilerOptions) : undefined);
       });
+      this.typeProgram = ts.createProgram([...this.cache.keys()], options, host);
       this.typeChecker = this.typeProgram.getTypeChecker();
+      this.externalTypeSchemas = new TypeSchemas(this.typeChecker);
     }
     const source = this.typeProgram.getSourceFile(file);
     if (!source) return null;
     let target = null;
     const find = (node) => {
-      if (node.pos === call.pos && node.end === call.end && ts.isCallExpression(node)) target = node;
+      if (node.pos === call.pos && node.end === call.end && node.kind === call.kind) target = node;
       else if (node.pos <= call.pos && node.end >= call.end) ts.forEachChild(node, find);
     };
     find(source);
     if (!target) return null;
     const checker = this.typeChecker;
-    const convert = (type, depth = 0) => {
-      if (!type || depth > 8 || type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.TypeParameter)) return null;
-      if (type.flags & ts.TypeFlags.StringLike) return { type: "string" };
-      if (type.flags & ts.TypeFlags.NumberLike) return { type: "number" };
-      if (type.flags & ts.TypeFlags.BooleanLike) return { type: "boolean" };
-      if (type.flags & ts.TypeFlags.Null) return { type: "null" };
-      if (type.isUnion()) {
-        const values = type.types.map((part) => convert(part, depth + 1));
-        // A partially unknown union cannot safely be narrowed.
-        if (values.some((part) => !part)) return null;
-        const unique = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
-        return unique.length === 1 ? unique[0] : { anyOf: unique };
-      }
-      if (checker.isArrayType(type)) {
-        const item = convert(checker.getTypeArguments(type)[0], depth + 1);
-        return item ? { type: "array", items: item } : null;
-      }
-      return null;
-    };
-    return convert(checker.getAwaitedType(checker.getTypeAtLocation(target)));
+    const schema = this.externalTypeSchemas.convert(checker.getAwaitedType(checker.getTypeAtLocation(target)));
+    const signature = ts.isCallExpression(target) ? checker.getResolvedSignature(target) : null;
+    const returns = signature?.getJsDocTags().find((tag) => tag.name === "returns" || tag.name === "return");
+    const description = ts.displayPartsToString(returns?.text);
+    return schema && description ? { ...schema, description } : schema;
   }
   knownMissingEnvironment(file, expression, depth = 0) {
     if (!expression || depth > 18) return false;

@@ -386,7 +386,9 @@ function sequelizeDefinitionShape(project, modelFile, definition, sourceFile = m
       BOOLEAN: { type: "boolean" }, DATE: { type: "string", format: "date-time" }, DATEONLY: { type: "string", format: "date" },
       INTEGER: { type: "integer" }, BIGINT: { type: "integer" }, SMALLINT: { type: "integer" }, TINYINT: { type: "integer" },
       FLOAT: { type: "number" }, DOUBLE: { type: "number" }, REAL: { type: "number" }, DECIMAL: { type: "number" },
-      JSON: {}, JSONB: {}, BLOB: { type: "string", format: "byte" },
+      JSON: { type: ["object", "array", "string", "number", "boolean", "null"] },
+      JSONB: { type: ["object", "array", "string", "number", "boolean", "null"] },
+      BLOB: { type: "string", format: "byte" },
     }[datatype];
     if (!col) continue;
     if (datatype === "JSON" || datatype === "JSONB") {
@@ -783,7 +785,14 @@ function shape(project, file, expression, scope, depth = 0) {
     }
     return { type: "object", properties, ...(required.length ? { required: unique(required) } : {}) };
   }
-  if (ts.isArrayLiteralExpression(node)) return { type: "array", items: node.elements.length ? shape(project, file, node.elements[0], scope, depth + 1) : {} };
+  if (ts.isArrayLiteralExpression(node)) {
+    const variants = node.elements.map((item) => {
+      const value = shape(project, file, ts.isSpreadElement(item) ? item.expression : item, scope, depth + 1);
+      return ts.isSpreadElement(item) ? value.items ?? {} : value;
+    });
+    const items = [...new Map(variants.map((value) => [JSON.stringify(value), value])).values()];
+    return { type: "array", items: items.length === 1 ? items[0] : items.length ? { anyOf: items } : {}, ...(!items.length ? { maxItems: 0 } : {}) };
+  }
   if (ts.isTemplateExpression(node) || ts.isNoSubstitutionTemplateLiteral(node)) return { type: "string" };
   // A Date serializes to an ISO 8601 string when passed to res.json().
   if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "Date") {
@@ -872,16 +881,21 @@ function shape(project, file, expression, scope, depth = 0) {
       const inferred = modelFieldsByNames(project, Object.keys(properties));
       return { type: "object", properties: { ...properties, ...inferred } };
     }
-    if (method === "count") return { type: "integer", minimum: 0 };
-    if (["findAll", "findAndCountAll"].includes(method)) {
+    const isModelQuery = ["count", "findAll", "findAndCountAll", "findByPk", "findOne"].includes(method) &&
+      sequelizeDefinition(project, file, node.expression.expression);
+    if (method === "count" && isModelQuery) return { type: "integer", minimum: 0 };
+    if (["findAll", "findAndCountAll"].includes(method) && isModelQuery) {
       const item = sequelizeModelShape(project, file, node);
       return method === "findAll" ? { type: "array", items: item } : {
         type: "object", properties: { rows: { type: "array", items: item }, count: { type: "integer", minimum: 0 } },
         required: ["rows", "count"],
       };
     }
-    if (method === "findByPk" || method === "findOne") return sequelizeModelShape(project, file, node);
-    if (["toISOString", "toJSON"].includes(method)) return method === "toISOString" ? { type: "string", format: "date-time" } : {};
+    if ((method === "findByPk" || method === "findOne") && isModelQuery) return sequelizeModelShape(project, file, node);
+    if (["toISOString", "toJSON"].includes(method)) {
+      const declared = project.externalCallSchema(file, node);
+      if (declared) return declared;
+    }
     if (["slice", "trim", "toLowerCase", "toUpperCase", "substring", "replace"].includes(method)) {
       const receiver = shape(project, file, node.expression.expression, scope, depth + 1);
       if (receiver.type === "string") return { type: "string" };
@@ -898,8 +912,27 @@ function shape(project, file, expression, scope, depth = 0) {
       if (method === "filter") return original.type === "array" ? original : { type: "array", items: {} };
       const callback = unwrap(node.arguments[0]);
       if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
-        const item = shape(project, file, callback.body, scope, depth + 1);
-        return { type: "array", items: item };
+        const callbackScope = scopeOf(callback, scope);
+        callbackScope.argumentSchemas = new Map(scope.argumentSchemas ?? []);
+        const parameter = callback.parameters[0]?.name;
+        const bindSchema = (name, schema) => {
+          if (!name) return;
+          if (ts.isIdentifier(name)) callbackScope.argumentSchemas.set(name.text, schema);
+          if (ts.isObjectBindingPattern(name)) for (const entry of name.elements) {
+            const key = propertyName(entry.propertyName ?? entry.name);
+            bindSchema(entry.name, schema.properties?.[key] ?? {});
+          }
+        };
+        bindSchema(parameter, original.items ?? {});
+        if (!ts.isBlock(callback.body)) return { type: "array", items: shape(project, file, callback.body, callbackScope, depth + 1) };
+        const variants = [];
+        const visit = (child) => {
+          if (functionLike(child)) return;
+          if (ts.isReturnStatement(child) && child.expression) variants.push(shape(project, file, child.expression, callbackScope, depth + 1));
+          ts.forEachChild(child, visit);
+        };
+        visit(callback.body);
+        return { type: "array", items: variants.length === 1 ? variants[0] : variants.length ? { anyOf: variants } : {} };
       }
       return { type: "array", items: {} };
     }
@@ -925,10 +958,9 @@ function shape(project, file, expression, scope, depth = 0) {
       else visit(target.node.body ?? target.node);
       if (expressions.length) {
         const values = expressions.map((value) => shape(project, target.file, value, childScope, depth + 1));
-        const meaningful = values.filter((value) => Object.keys(value).length);
-        if (meaningful.length === 1) return meaningful[0];
-        if (meaningful.length > 1) {
-          const unique = [...new Map(meaningful.map((value) => [JSON.stringify(value), value])).values()];
+        if (values.length === 1 && Object.keys(values[0]).length) return values[0];
+        if (values.length > 1) {
+          const unique = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
           return unique.length === 1 ? unique[0] : { anyOf: unique };
         }
       }
@@ -943,6 +975,10 @@ function shape(project, file, expression, scope, depth = 0) {
   }
   if (statusValues(project, file, node, scope).length) return { type: "integer" };
   if (ts.isPropertyAccessExpression(node) && member(node) === "status") return { type: "integer" };
+  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    const declared = project.externalCallSchema(file, node);
+    if (declared) return declared;
+  }
   return {};
 }
 function fnBodies(project, file, expr, depth = 0) {
@@ -1001,6 +1037,7 @@ function securityOf(project, file, fn, scope, errors) {
 function outputOf(project, file, fn, scope) {
   const responses = [];
   const errors = new Set();
+  const thrownErrors = new Set();
   const errorMessages = new Map();
   const dto = [];
   const securityCandidates = [];
@@ -1013,6 +1050,7 @@ function outputOf(project, file, fn, scope) {
         const messages = textValues(project, file, exception.arguments?.[1], scope);
         for (const status of possible) if (status >= 400) {
           errors.add(status);
+          thrownErrors.add(status);
           if (messages.length) {
             if (!errorMessages.has(status)) errorMessages.set(status, new Set());
             for (const message of messages) errorMessages.get(status).add(message);
@@ -1058,7 +1096,9 @@ function outputOf(project, file, fn, scope) {
       }
       if (!responseRoot(node.expression, scope.res)) return;
       if (method === "sendStatus") {
-        for (const status of statusValues(project, file, node.arguments[0], scope)) responses.push({ status, schema: null });
+        for (const status of statusValues(project, file, node.arguments[0], scope)) {
+          responses.push({ status, mediaType: "text/plain", schema: { type: "string", const: statusText(status) } });
+        }
       }
       if (!["json", "send", "end", "redirect"].includes(method)) return;
       let statusExpressions = [];
@@ -1067,22 +1107,38 @@ function outputOf(project, file, fn, scope) {
         if (member(current.expression) === "status") statusExpressions.push(current.arguments[0]);
         current = ts.isPropertyAccessExpression(current.expression) || ts.isElementAccessExpression(current.expression) ? unwrap(current.expression.expression) : null;
       }
+      if (method === "redirect" && node.arguments.length > 1) statusExpressions = [node.arguments[0]];
       const statuses = statusExpressions.length ? unique(statusExpressions.flatMap((expr) => statusValues(project, file, expr, scope))) : [method === "redirect" ? 302 : 200];
       if (!statuses.length) {
         project.diagnostics.push({ level: "warning", code: "UNKNOWN_STATUS", message: `Response status cannot be inferred (${file})` });
       }
       const body = method === "json" ? shape(project, file, node.arguments[0], scope) : method === "send" ? shape(project, file, node.arguments[0], scope) : null;
+      let mediaType = method === "send" && body?.type === "string" ? "text/html" : "application/json";
+      let chain = unwrap(node.expression.expression);
+      while (chain && ts.isCallExpression(chain)) {
+        const name = member(chain.expression);
+        let configured;
+        if (["type", "contentType"].includes(name)) configured = project.staticValue(file, chain.arguments[0]);
+        if (["set", "header"].includes(name) && String(project.staticValue(file, chain.arguments[0])).toLowerCase() === "content-type") configured = project.staticValue(file, chain.arguments[1]);
+        if (typeof configured === "string") {
+          mediaType = ({ json: "application/json", html: "text/html", text: "text/plain", txt: "text/plain", xml: "application/xml" })[configured] ?? configured;
+          break;
+        }
+        chain = chain.expression.expression && unwrap(chain.expression.expression);
+      }
+      const location = method === "redirect" ? project.staticValue(file, node.arguments.at(-1)) : undefined;
       for (const status of statuses) {
         if (status >= 400) errors.add(status);
-        responses.push({ status, schema: body });
+        responses.push({ status, schema: body, mediaType,
+          ...(method === "redirect" ? { headers: { Location: { schema: { type: "string", ...(typeof location === "string" ? { const: location } : {}) } } } } : {}) });
       }
     }
   });
   securityCandidates.push(...securityOf(project, file, fn, scope, errors));
-  return { responses, errors, errorMessages, dto, securityCandidates };
+  return { responses, errors, thrownErrors, errorMessages, dto, securityCandidates };
 }
 function analyzeExpression(project, item, depthLimit = 15, isEndpoint = false) {
-  const results = { responses: [], errors: new Set(), errorMessages: new Map(), dto: [], securityCandidates: [] };
+  const results = { responses: [], errors: new Set(), thrownErrors: new Set(), errorMessages: new Map(), dto: [], securityCandidates: [] };
   const processed = new Set();
   const analyzeFn = (file, fn, depth, scope = scopeOf(fn)) => {
     if (depth > depthLimit || processed.size > 350) {
@@ -1097,6 +1153,7 @@ function analyzeExpression(project, item, depthLimit = 15, isEndpoint = false) {
     const details = outputOf(project, file, fn, scope);
     results.responses.push(...details.responses);
     for (const error of details.errors) results.errors.add(error);
+    for (const error of details.thrownErrors) results.thrownErrors.add(error);
     for (const [status, messages] of details.errorMessages) {
       if (!results.errorMessages.has(status)) results.errorMessages.set(status, new Set());
       for (const message of messages) results.errorMessages.get(status).add(message);
@@ -1126,12 +1183,16 @@ export function analyzeRoute(project, route) {
     conditional: item.conditional === true,
   }));
   const errors = new Set();
+  const thrownErrors = new Set();
   const errorMessages = new Map();
   const dto = [];
   const candidates = [];
+  const responses = [];
   let successes = [];
   for (const result of analyzed) {
+    responses.push(...result.responses);
     for (const status of result.errors) errors.add(status);
+    for (const status of result.thrownErrors) thrownErrors.add(status);
     for (const [status, messages] of result.errorMessages) {
       if (!errorMessages.has(status)) errorMessages.set(status, new Set());
       for (const message of messages) errorMessages.get(status).add(message);
@@ -1146,5 +1207,5 @@ export function analyzeRoute(project, route) {
     if (!existing) distinct.push(item);
     else if (!item.conditional) existing.conditional = false;
   }
-  return { errors, errorMessages, dto: distinct, securityCandidates: candidates.filter((value, index, array) => array.findIndex((x) => x.in === value.in && x.name === value.name) === index), successes };
+  return { errors, thrownErrors, errorMessages, dto: distinct, securityCandidates: candidates.filter((value, index, array) => array.findIndex((x) => x.in === value.in && x.name === value.name) === index), successes, responses };
 }

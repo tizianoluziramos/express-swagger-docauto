@@ -2,6 +2,7 @@ import path from "node:path";
 import { Project } from "./project.js";
 import { discoverRoutes } from "./routes.js";
 import { analyzeRoute, statusText } from "./analyze.js";
+import { schemaAlternatives } from "./schema-variants.js";
 import { syntax as ts, member, propertyName, walk } from "./project.js";
 
 const supportedMethods = ["get", "post", "put", "patch", "delete", "head", "options", "trace"];
@@ -139,8 +140,7 @@ function documentedResponses(known, errors, method, errorSchema, errorMessages, 
       (content[mediaType] ??= []).push(variant.schema);
     }
     for (const [mediaType, values] of Object.entries(content)) {
-      const schemas = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
-      content[mediaType] = { schema: schemas.length === 1 ? schemas[0] : { anyOf: schemas } };
+      content[mediaType] = { schema: schemaAlternatives(values) };
     }
     output[String(status)] = {
       description: statusText(status),
@@ -233,7 +233,8 @@ function operationFor(route, report, schemeRegistry, errorHandling) {
 }
 function unknownResponseFields(schema, field = "$", components = {}, seen = new Set()) {
   if (!schema || typeof schema !== "object") return [];
-  if (!Object.keys(schema).some((key) => !["description", "deprecated", "title", "example", "examples"].includes(key))) return [field];
+  if (!Object.keys(schema).some((key) => !key.startsWith("x-") &&
+    !["description", "deprecated", "title", "example", "examples"].includes(key))) return [field];
   if (schema.$ref?.startsWith("#/components/schemas/")) {
     if (seen.has(schema.$ref)) return [];
     const next = new Set(seen); next.add(schema.$ref);
@@ -252,11 +253,27 @@ function unknownResponseFields(schema, field = "$", components = {}, seen = new 
   }
   return [...new Set(unknown)];
 }
+function referencedSchemas(document, available) {
+  const schemas = {};
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (value.$ref?.startsWith("#/components/schemas/")) {
+      const name = value.$ref.slice("#/components/schemas/".length);
+      if (!Object.hasOwn(schemas, name) && available[name]) {
+        schemas[name] = available[name];
+        visit(available[name]);
+      }
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(document.paths);
+  return schemas;
+}
 export async function generateOpenApi({
   root = process.cwd(), entry = "src/app.js", title, version, strict = false, loadSchemas = true,
 } = {}) {
   const diagnostics = [];
-  const project = new Project(root, diagnostics);
+  const project = new Project(root, diagnostics, entry);
   const routes = discoverRoutes(project, entry, diagnostics);
   if (!routes.length) diagnostics.push({ level: "warning", code: "NO_ROUTES", message: `No statically discoverable Express routes from ${entry}` });
   const errorHandling = discoverGlobalErrorHandling(project, entry);
@@ -268,9 +285,10 @@ export async function generateOpenApi({
   for (const route of routes) {
     const report = analyzeRoute(project, route);
     const key = normalize(route.path);
-    for (const response of report.responses.filter((item) => route.method !== "head" && item.status >= 200 && ![204, 205, 304].includes(item.status))) for (const field of unknownResponseFields(response.schema, "$", project.externalTypeSchemas?.schemas)) {
+    for (const response of report.responses.filter((item) => route.method !== "head" && item.status >= 200 && ![204, 205, 304].includes(item.status))) for (const field of unknownResponseFields(response.schema, "$", project.inference.types?.schemas)) {
+      const reason = response.expression ? project.inference.explain(response.file, response.expression, field) : "No static type information";
       diagnostics.push({ level: "warning", code: "UNRESOLVED_RESPONSE_SCHEMA",
-        message: `Response ${response.status} of ${route.method.toUpperCase()} ${key} has an unknown schema at ${field} (${route.location})` });
+        message: `Response ${response.status} of ${route.method.toUpperCase()} ${key} has an unknown schema at ${field}: ${reason} (${route.location})` });
     }
     if (!document.paths[key]) document.paths[key] = {};
     const methods = route.method === "all" ? supportedMethods : [route.method];
@@ -281,7 +299,8 @@ export async function generateOpenApi({
     if (!report.successes.length) diagnostics.push({ level: "warning", code: "UNKNOWN_RESPONSE", message: `Response of ${route.method.toUpperCase()} ${key} cannot be fully inferred` });
   }
   if (!Object.keys(document.components.securitySchemes).length) delete document.components.securitySchemes;
-  if (Object.keys(project.externalTypeSchemas?.schemas ?? {}).length) document.components.schemas = project.externalTypeSchemas.schemas;
+  const schemas = referencedSchemas(document, project.inference.types?.schemas ?? {});
+  if (Object.keys(schemas).length) document.components.schemas = schemas;
   if (!Object.keys(document.components).length) delete document.components;
   if (strict && diagnostics.some((issue) => issue.level === "warning" || issue.level === "error")) {
     const sample = diagnostics.slice(0, 10).map((item) => `[${item.code}] ${item.message}`).join("\n");

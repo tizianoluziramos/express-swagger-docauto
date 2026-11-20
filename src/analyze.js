@@ -1,6 +1,7 @@
 import http from "node:http";
 import { syntax as ts, member, propertyName, unwrap, walk } from "./project.js";
 import { schemaFromExpression } from "./schemas.js";
+import { schemaAlternatives } from "./schema-variants.js";
 
 const phrases = new Map(Object.entries(http.STATUS_CODES).map(([code, name]) => [name.toUpperCase().replace(/[^A-Z0-9]/g, ""), Number(code)]));
 export const statusText = (code) => http.STATUS_CODES[code] ?? "Response";
@@ -106,6 +107,8 @@ function invocationScope(project, callerFile, fnFile, fn, args, parent, closure)
     bind(parameter.name, value);
     if (ts.isIdentifier(parameter.name) && args[index]) {
       scope.argumentExpressions.set(parameter.name.text, { file: callerFile, node: args[index], scope: parent });
+      if (responseRoot(args[index], parent.res, parent.binds)) scope.res = parameter.name.text;
+      if (responseRoot(args[index], parent.req, parent.binds)) scope.req = parameter.name.text;
     }
   });
   return scope;
@@ -158,10 +161,18 @@ function expressionLocation(project, file, expression, scope, depth = 0) {
   }
   return null;
 }
-function responseRoot(expression, name) {
+function responseRoot(expression, name, bindings) {
   let current = unwrap(expression);
+  const seen = new Set();
   for (let depth = 0; depth < 10; depth++) {
-    if (ts.isIdentifier(current)) return current.text === name;
+    if (!current) return false;
+    if (ts.isIdentifier(current)) {
+      if (current.text === name) return true;
+      if (seen.has(current.text) || !bindings?.has(current.text)) return false;
+      seen.add(current.text);
+      current = unwrap(bindings.get(current.text));
+      continue;
+    }
     if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) current = unwrap(current.expression);
     else if (ts.isCallExpression(current)) current = unwrap(current.expression);
     else return false;
@@ -225,32 +236,44 @@ function statusValues(project, file, expression, scope, depth = 0) {
   const node = unwrapAwait(expression);
   const known = scopedValue(project, file, node, scope);
   if (typeof known === "number" && known >= 100 && known < 600) return [known];
+  const declared = project.inference.literalValues(file, node)
+    .filter((value) => Number.isInteger(value) && value >= 100 && value < 600);
+  if (declared.length === 1) return declared;
+  // JS object properties may widen a specific enum member to the whole enum.
+  // Concrete source/argument evidence must win before a declared union.
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const name = member(node) ?? project.staticValue(file, node.argumentExpression);
     if (name === "status" || name === "statusCode") {
       const result = returnedObject(project, file, node.expression, scope);
-      return unique(result.flatMap((item) => {
+      const values = unique(result.flatMap((item) => {
         const field = objectProperty(item.node, name);
         return field ? statusValues(project, item.file, field, item.scope, depth + 1) : [];
       }));
+      if (values.length) return values;
     }
     const mapped = phrases.get(names(name));
     if (mapped) return [mapped];
   }
   if (ts.isIdentifier(node)) {
+    const argument = scope.argumentExpressions?.get(node.text);
+    if (argument) {
+      const values = statusValues(project, argument.file, argument.node, argument.scope, depth + 1);
+      if (values.length) return values;
+    }
     if (scope.destructured.has(node.text)) {
       const { source, key } = scope.destructured.get(node.text);
       const results = returnedObject(project, file, source, scope);
-      return unique(results.flatMap((item) => {
+      const values = unique(results.flatMap((item) => {
         const attr = objectProperty(item.node, key);
         return attr ? statusValues(project, item.file, attr, item.scope, depth + 1) : [];
       }));
+      if (values.length) return values;
     }
     const bound = scope.binds.get(node.text);
     if (bound && bound !== node) return statusValues(project, file, bound, scope, depth + 1);
   }
   if (ts.isConditionalExpression(node)) return unique([...statusValues(project, file, node.whenTrue, scope, depth + 1), ...statusValues(project, file, node.whenFalse, scope, depth + 1)]);
-  return [];
+  return unique(declared);
 }
 // Preserve values explicitly declared in source code without executing the API.
 // Scope-aware resolution handles `const result = await service.method()` and
@@ -264,6 +287,8 @@ function textValues(project, file, expression, scope, depth = 0, visited = new S
   const next = new Set(visited); next.add(position);
   const literal = scopedValue(project, file, node, scope);
   if (typeof literal === "string") return [literal];
+  const declared = project.inference.literalValues(file, node).filter((value) => typeof value === "string");
+  if (declared.length) return unique(declared);
   if (ts.isConditionalExpression(node)) {
     return unique([
       ...textValues(project, file, node.whenTrue, scope, depth + 1, next),
@@ -757,7 +782,52 @@ function modelFieldsByNames(project, names) {
   return Object.fromEntries(names.filter((name) => Object.hasOwn(matches[0], name)).map((name) => [name, matches[0][name]]));
 }
 
-function shape(project, file, expression, scope, depth = 0) {
+// TypeScript owns type structure. The flow pass supplies invocation-specific
+// values and fills gaps left by any/unknown or dynamic, untyped APIs.
+function preferType(project, typed, flow, active = new Set()) {
+  if (!typed || !Object.keys(typed).length) return flow ?? {};
+  if (!flow || !Object.keys(flow).length) return typed;
+  if (typed.$ref) {
+    if (active.has(typed.$ref)) return typed;
+    const target = project.inference.types.schemas[typed.$ref.split("/").at(-1)];
+    if (!target) return typed;
+    const next = new Set(active); next.add(typed.$ref);
+    const merged = preferType(project, target, flow, next);
+    return JSON.stringify(merged) === JSON.stringify(target) ? typed : merged;
+  }
+  if (typed.type === "object" && flow.type === "object") {
+    const properties = { ...typed.properties };
+    for (const [key, value] of Object.entries(properties)) {
+      properties[key] = preferType(project, value, flow.properties?.[key], active);
+      if (["status", "statusCode", "message"].includes(key) && flow.properties?.[key]?.example !== undefined) {
+        // These are explicit source values, not guesses from SDK metadata.
+        const { description, deprecated } = properties[key];
+        properties[key] = {
+          ...(description ? { description } : {}),
+          ...(deprecated ? { deprecated } : {}),
+          ...flow.properties[key],
+        };
+      }
+    }
+    return { ...typed, properties };
+  }
+  if (typed.type === "array" && flow.type === "array" && !typed.prefixItems) {
+    return { ...typed, items: preferType(project, typed.items, flow.items, active) };
+  }
+  return typed;
+}
+function shape(project, file, expression, scope, depth = 0, awaited = false) {
+  if (!expression || depth > 15) return {};
+  const { schema: declared, issues } = project.inference.infer(file, expression, awaited);
+  const node = unwrapAwait(expression);
+  if (declared && !issues.length && ts.isCallExpression(node)) {
+    const target = functionTarget(project, file, node.expression, scope);
+    if (!target || !functionLike(target.node)) return declared;
+  }
+  const flow = flowShape(project, file, expression, scope, depth);
+  return preferType(project, declared, flow);
+}
+function flowShape(project, file, expression, scope, depth = 0) {
   if (!expression || depth > 15) return {};
   const node = unwrapAwait(expression);
   const literal = project.staticValue(file, node);
@@ -800,8 +870,8 @@ function shape(project, file, expression, scope, depth = 0) {
   }
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     const key = member(node) ?? (ts.isElementAccessExpression(node) ? project.staticValue(file, node.argumentExpression) : null);
-    if (key === "length") return { type: "integer", minimum: 0 };
     const sourceSchema = shape(project, file, node.expression, scope, depth + 1);
+    if (key === "length" && ["array", "string"].includes(sourceSchema.type)) return { type: "integer", minimum: 0 };
     if (sourceSchema.type === "object" && typeof key === "string" && sourceSchema.properties?.[key]) {
       return sourceSchema.properties[key];
     }
@@ -818,7 +888,9 @@ function shape(project, file, expression, scope, depth = 0) {
       const right = shape(project, file, node.right, scope, depth + 1);
       if (node.operatorToken.kind === ts.SyntaxKind.PlusToken && (left.type === "string" || right.type === "string")) return { type: "string" };
       if (left.type === "integer" && right.type === "integer" && node.operatorToken.kind !== ts.SyntaxKind.SlashToken) return { type: "integer" };
-      return { type: "number" };
+      return left.type === "number" || left.type === "integer"
+        ? right.type === "number" || right.type === "integer" ? { type: "number" } : {}
+        : {};
     }
     if ([ts.SyntaxKind.EqualsEqualsEqualsToken, ts.SyntaxKind.EqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsEqualsToken, ts.SyntaxKind.ExclamationEqualsToken, ts.SyntaxKind.GreaterThanToken, ts.SyntaxKind.LessThanToken].includes(node.operatorToken.kind)) return { type: "boolean" };
     if ([ts.SyntaxKind.PlusToken].includes(node.operatorToken.kind) && shape(project, file, node.left, scope, depth + 1).type === "string") return { type: "string" };
@@ -833,6 +905,8 @@ function shape(project, file, expression, scope, depth = 0) {
   if (ts.isIdentifier(node)) {
     const incoming = scope.argumentSchemas?.get(node.text);
     if (incoming && Object.keys(incoming).length) return incoming;
+    const argument = scope.argumentExpressions?.get(node.text);
+    if (argument) return shape(project, argument.file, argument.node, argument.scope, depth + 1);
     const incomingValue = scope.argumentValues?.get(node.text);
     if (typeof incomingValue === "string") return { type: "string" };
     if (typeof incomingValue === "number") return { type: Number.isInteger(incomingValue) ? "integer" : "number" };
@@ -892,10 +966,6 @@ function shape(project, file, expression, scope, depth = 0) {
       };
     }
     if ((method === "findByPk" || method === "findOne") && isModelQuery) return sequelizeModelShape(project, file, node);
-    if (["toISOString", "toJSON"].includes(method)) {
-      const declared = project.externalCallSchema(file, node);
-      if (declared) return declared;
-    }
     if (["slice", "trim", "toLowerCase", "toUpperCase", "substring", "replace"].includes(method)) {
       const receiver = shape(project, file, node.expression.expression, scope, depth + 1);
       if (receiver.type === "string") return { type: "string" };
@@ -909,6 +979,7 @@ function shape(project, file, expression, scope, depth = 0) {
     }
     if (method === "map" || method === "filter") {
       const original = shape(project, file, node.expression.expression, scope, depth + 1);
+      if (original.type !== "array") return {};
       if (method === "filter") return original.type === "array" ? original : { type: "array", items: {} };
       const callback = unwrap(node.arguments[0]);
       if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
@@ -957,11 +1028,10 @@ function shape(project, file, expression, scope, depth = 0) {
       if (ts.isArrowFunction(target.node) && !ts.isBlock(target.node.body)) expressions.push(target.node.body);
       else visit(target.node.body ?? target.node);
       if (expressions.length) {
-        const values = expressions.map((value) => shape(project, target.file, value, childScope, depth + 1));
+        const values = expressions.map((value) => shape(project, target.file, value, childScope, depth + 1, true));
         if (values.length === 1 && Object.keys(values[0]).length) return values[0];
         if (values.length > 1) {
-          const unique = [...new Map(values.map((value) => [JSON.stringify(value), value])).values()];
-          return unique.length === 1 ? unique[0] : { anyOf: unique };
+          return schemaAlternatives(values);
         }
       }
     }
@@ -970,15 +1040,8 @@ function shape(project, file, expression, scope, depth = 0) {
       const variants = returns.map((value) => shape(project, value.file, value.node, value.scope, depth + 1));
       return variants.length === 1 ? variants[0] : { anyOf: variants };
     }
-    const declared = project.externalCallSchema(file, node);
-    if (declared) return declared;
   }
   if (statusValues(project, file, node, scope).length) return { type: "integer" };
-  if (ts.isPropertyAccessExpression(node) && member(node) === "status") return { type: "integer" };
-  if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-    const declared = project.externalCallSchema(file, node);
-    if (declared) return declared;
-  }
   return {};
 }
 function fnBodies(project, file, expr, depth = 0) {
@@ -1094,7 +1157,7 @@ function outputOf(project, file, fn, scope) {
           }
         }
       }
-      if (!responseRoot(node.expression, scope.res)) return;
+      if (!responseRoot(node.expression, scope.res, scope.binds)) return;
       if (method === "sendStatus") {
         for (const status of statusValues(project, file, node.arguments[0], scope)) {
           responses.push({ status, mediaType: "text/plain", schema: { type: "string", const: statusText(status) } });
@@ -1129,7 +1192,7 @@ function outputOf(project, file, fn, scope) {
       const location = method === "redirect" ? project.staticValue(file, node.arguments.at(-1)) : undefined;
       for (const status of statuses) {
         if (status >= 400) errors.add(status);
-        responses.push({ status, schema: body, mediaType,
+        responses.push({ status, schema: body, mediaType, expression: node.arguments[0], file,
           ...(method === "redirect" ? { headers: { Location: { schema: { type: "string", ...(typeof location === "string" ? { const: location } : {}) } } } } : {}) });
       }
     }

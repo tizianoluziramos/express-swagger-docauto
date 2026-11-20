@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseEnv } from "node:util";
 import ts from "typescript";
-import { TypeSchemas } from "./types.js";
+import { TypeInference } from "./inference.js";
 
 const extensions = new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"]);
 const ignored = new Set(["node_modules", ".git", ".next", "dist", "build", "coverage", "vendor", ".turbo", ".yarn", "__tests__", "test", "tests"]);
@@ -32,7 +32,7 @@ function allFiles(directory, out = [], depth = 0) {
 const scriptKind = (name) => name.endsWith(".tsx") ? ts.ScriptKind.TSX : name.endsWith(".ts") || name.endsWith(".mts") || name.endsWith(".cts") ? ts.ScriptKind.TS : name.endsWith(".jsx") ? ts.ScriptKind.JSX : ts.ScriptKind.JS;
 
 export class Project {
-  constructor(root, diagnostics = []) {
+  constructor(root, diagnostics = [], entry) {
     this.root = path.resolve(root);
     this.diagnostics = diagnostics;
     this.cache = new Map();
@@ -44,20 +44,18 @@ export class Project {
     }
     const packageFile = path.join(this.root, "package.json");
     this.pkg = fs.existsSync(packageFile) ? JSON.parse(fs.readFileSync(packageFile, "utf8")) : {};
-    const configFile = ts.findConfigFile(this.root, ts.sys.fileExists, "tsconfig.json");
-    this.compilerOptions = {};
-    if (configFile) {
-      const content = ts.readConfigFile(configFile, ts.sys.readFile);
-      if (!content.error) this.compilerOptions = ts.parseJsonConfigFileContent(content.config, ts.sys, path.dirname(configFile)).options;
-    }
-    for (const filename of allFiles(this.root)) this.file(filename);
+    const files = allFiles(this.root);
+    this.inference = new TypeInference(this.root, files, diagnostics, entry, this.pkg);
+    this.compilerOptions = this.inference.options;
+    for (const filename of files) this.file(filename);
   }
   file(name) {
     const file = path.resolve(name);
     if (this.cache.has(file)) return this.cache.get(file);
-    if (!fs.existsSync(file) || !fs.statSync(file).isFile() || !this.isLocal(file)) return null;
-    const contents = fs.readFileSync(file, "utf8");
-    const ast = ts.createSourceFile(file, contents, ts.ScriptTarget.Latest, true, scriptKind(file));
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile() || !this.isLocal(file) ||
+      file.replaceAll("\\", "/").includes("/node_modules/") || /\.d\.[cm]?ts$/.test(file)) return null;
+    const ast = this.inference.source(file) ??
+      ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true, scriptKind(file));
     const model = { file, ast, imports: new Map(), bindings: new Map(), exports: new Map(), statements: [] };
     this.cache.set(file, model);
     for (const statement of ast.statements) {
@@ -69,7 +67,7 @@ export class Project {
       }
       if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
         const spec = statement.moduleSpecifier.text;
-        const target = this.resolveImport(file, spec);
+        const target = this.resolveImport(file, spec, statement.moduleSpecifier);
         const clause = statement.importClause;
         if (clause?.name) model.imports.set(clause.name.text, { file: target, name: "default", spec });
         if (clause?.namedBindings && ts.isNamespaceImport(clause.namedBindings)) model.imports.set(clause.namedBindings.name.text, { file: target, name: "*", spec });
@@ -77,9 +75,13 @@ export class Project {
           model.imports.set(binding.name.text, { file: target, name: (binding.propertyName ?? binding.name).text, spec });
         }
       }
-      if (ts.isImportEqualsDeclaration(statement)) continue;
+      if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference) &&
+        statement.moduleReference.expression && ts.isStringLiteralLike(statement.moduleReference.expression)) {
+        const spec = statement.moduleReference.expression.text;
+        model.imports.set(statement.name.text, { file: this.resolveImport(file, spec, statement.moduleReference.expression), name: "default", spec });
+      }
       if (ts.isExportDeclaration(statement)) {
-        const target = statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier) ? this.resolveImport(file, statement.moduleSpecifier.text) : file;
+        const target = statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier) ? this.resolveImport(file, statement.moduleSpecifier.text, statement.moduleSpecifier) : file;
         if (statement.exportClause && ts.isNamedExports(statement.exportClause)) {
           for (const item of statement.exportClause.elements) model.exports.set(item.name.text, { file: target, name: (item.propertyName ?? item.name).text });
         } else if (target) model.exports.set("*", { file: target, name: "*" });
@@ -94,7 +96,7 @@ export class Project {
         const init = declaration.initializer;
         if (init && ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === "require" && init.arguments.length && ts.isStringLiteralLike(init.arguments[0])) {
           const spec = init.arguments[0].text;
-          const target = this.resolveImport(file, spec);
+          const target = this.resolveImport(file, spec, init.arguments[0]);
           if (ts.isIdentifier(declaration.name)) model.imports.set(declaration.name.text, { file: target, name: "default", spec });
           else if (ts.isObjectBindingPattern(declaration.name)) for (const element of declaration.name.elements) {
             const name = ts.isIdentifier(element.name) ? element.name.text : null;
@@ -116,8 +118,12 @@ export class Project {
   isExported(node) { return Boolean(node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)); }
   isDefault(node) { return Boolean(node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)); }
   isLocal(file) { return !(path.relative(this.root, file).startsWith(`..${path.sep}`) || path.relative(this.root, file) === ".."); }
-  resolveImport(from, spec) {
+  resolveImport(from, spec, usage) {
     if (typeof spec !== "string") return null;
+    const resolved = this.inference.resolve(from, spec, usage);
+    if (resolved) return path.resolve(resolved);
+    // Compatibility for legacy local route specifiers which the configured
+    // compiler mode rejects. Dependency types never use this fallback.
     let target;
     if (spec.startsWith(".")) target = path.resolve(path.dirname(from), spec);
     else if (spec.startsWith("#/")) {
@@ -126,9 +132,6 @@ export class Project {
     } else if (spec.startsWith("#")) {
       const mapped = this.pkg.imports?.[spec];
       if (typeof mapped === "string") target = path.resolve(this.root, mapped);
-    } else if (this.compilerOptions.baseUrl || this.compilerOptions.paths) {
-      const result = ts.resolveModuleName(spec, from, { ...this.compilerOptions, allowJs: true }, ts.sys).resolvedModule?.resolvedFileName;
-      if (result && this.isLocal(result) && !result.includes(`${path.sep}node_modules${path.sep}`)) target = result;
     }
     if (!target) return null;
     const stem = target.replace(/\.(js|mjs|cjs|ts|tsx|jsx|mts|cts)$/, "");
@@ -145,7 +148,10 @@ export class Project {
     seen.add(key);
     if (ts.isIdentifier(node)) {
       const imp = model.imports.get(node.text);
-      if (imp?.file && imp.name !== "*") return this.exported(imp.file, imp.name, seen);
+      if (imp?.file && imp.name !== "*") {
+        const target = this.exported(imp.file, imp.name, seen);
+        if (target) return target;
+      }
       const bound = model.bindings.get(node.text);
       if (bound && bound !== node) return this.resolveExpression(file, bound, seen);
     }
@@ -153,12 +159,23 @@ export class Project {
       const lhs = unwrap(node.expression);
       if (ts.isIdentifier(lhs)) {
         const imp = model.imports.get(lhs.text);
-        if (imp?.file && imp.name === "*") return this.exported(imp.file, member(node), seen);
+        if (imp?.file && imp.name === "*") {
+          const target = this.exported(imp.file, member(node), seen);
+          if (target) return target;
+        }
         const bound = model.bindings.get(lhs.text);
         if (bound && ts.isObjectLiteralExpression(bound)) {
           const prop = bound.properties.find((entry) => ts.isPropertyAssignment(entry) && propertyName(entry.name) === member(node));
           if (prop) return this.resolveExpression(file, prop.initializer, seen);
         }
+      }
+    }
+    const declaration = this.inference.declaration(file, node);
+    if (declaration && declaration !== node) {
+      const source = path.resolve(declaration.getSourceFile().fileName);
+      if (this.isLocal(source) && !source.replaceAll("\\", "/").includes("/node_modules/")) {
+        const value = ts.isVariableDeclaration(declaration) && declaration.initializer ? declaration.initializer : declaration;
+        if (value !== node) return { file: source, node: value };
       }
     }
     return { file, node };
@@ -184,50 +201,6 @@ export class Project {
     const wildcard = model.exports.get("*");
     if (wildcard?.file) return this.exported(wildcard.file, exportedName, seen);
     return null;
-  }
-  externalCallSchema(file, call) {
-    // Read installed declarations, never import/execute the dependency or app.
-    // The receiver may be an instance imported through a local config/barrel.
-    // This is lazy: most schemas are resolved using our much cheaper AST pass.
-    if (!this.typeProgram) {
-      const options = {
-        ...this.compilerOptions, allowJs: true, checkJs: false, noEmit: true,
-        skipLibCheck: true, strictNullChecks: true, types: [], maxNodeModuleJsDepth: 2,
-        module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext,
-      };
-      const host = ts.createCompilerHost(options);
-      const moduleCache = ts.createModuleResolutionCache(this.root, host.getCanonicalFileName, options);
-      host.resolveModuleNameLiterals = (literals, from, redirect, compilerOptions, source) => literals.map((literal) => {
-        // Share the AST resolver's aliases (including #/*). Preserve TS's
-        // import/require resolution mode for conditional dependency exports.
-        const local = !literal.text.startsWith(".") && !from.replaceAll("\\", "/").includes("/node_modules/")
-          ? this.resolveImport(from, literal.text) : null;
-        if (local) {
-          const extension = Object.values(ts.Extension).sort((a, b) => b.length - a.length).find((ext) => local.endsWith(ext)) ?? ts.Extension.Js;
-          return { resolvedModule: { resolvedFileName: local, extension, isExternalLibraryImport: false } };
-        }
-        return ts.resolveModuleName(literal.text, from, compilerOptions, host, moduleCache, redirect,
-          source ? ts.getModeForUsageLocation(source, literal, compilerOptions) : undefined);
-      });
-      this.typeProgram = ts.createProgram([...this.cache.keys()], options, host);
-      this.typeChecker = this.typeProgram.getTypeChecker();
-      this.externalTypeSchemas = new TypeSchemas(this.typeChecker);
-    }
-    const source = this.typeProgram.getSourceFile(file);
-    if (!source) return null;
-    let target = null;
-    const find = (node) => {
-      if (node.pos === call.pos && node.end === call.end && node.kind === call.kind) target = node;
-      else if (node.pos <= call.pos && node.end >= call.end) ts.forEachChild(node, find);
-    };
-    find(source);
-    if (!target) return null;
-    const checker = this.typeChecker;
-    const schema = this.externalTypeSchemas.convert(checker.getAwaitedType(checker.getTypeAtLocation(target)));
-    const signature = ts.isCallExpression(target) ? checker.getResolvedSignature(target) : null;
-    const returns = signature?.getJsDocTags().find((tag) => tag.name === "returns" || tag.name === "return");
-    const description = ts.displayPartsToString(returns?.text);
-    return schema && description ? { ...schema, description } : schema;
   }
   knownMissingEnvironment(file, expression, depth = 0) {
     if (!expression || depth > 18) return false;
